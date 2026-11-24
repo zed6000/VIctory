@@ -362,11 +362,14 @@ fn take<T>(handle: *mut T) {
 
 impl Provider {
     /// The provider for the only user and `config` (the service
-    /// configuration id), under `saves`.
+    /// configuration id), under `saves`. An empty id names no
+    /// configuration, like none: as a folder name it would be the user's
+    /// folder itself, where the other configurations' folders are.
     fn open(saves: &Path, config: Option<&str>) -> Result<Provider, HRESULT> {
+        let config = config.filter(|c| !c.is_empty()).unwrap_or("default");
         let root = saves
             .join(format!("{:016X}", xuser::XUID))
-            .join(file_name(config.unwrap_or("default")));
+            .join(file_name(config));
         std::fs::create_dir_all(&root).map_err(|_| NO_ACCESS)?;
         let _saves = saves_lock();
         containers(&root); // converts old containers now
@@ -391,6 +394,21 @@ fn remaining(root: &Path) -> u64 {
     QUOTA
         .saturating_sub(used_bytes(root))
         .min(storage::disk_free(root))
+}
+
+/// Why an update writing `written` bytes, `replaced` of them over blobs it
+/// replaces, does not fit: past the per-user quota (`used` bytes kept), or
+/// past the host disk's `free` bytes, which is not the user's quota (the
+/// new version is written before the old one goes, so nothing it replaces
+/// counts there).
+fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
+    if written > QUOTA.saturating_sub(used) + replaced {
+        Some(QUOTA_EXCEEDED)
+    } else if written > free {
+        Some(OUT_OF_LOCAL_STORAGE)
+    } else {
+        None
+    }
 }
 
 fn io_error(dir: &Path, e: &std::io::Error) -> HRESULT {
@@ -446,8 +464,9 @@ impl Update {
             changed.map(|(_, size)| size).sum()
         });
         let root = self.dir.parent().unwrap_or(&self.dir);
-        if written as u64 > remaining(root) + replaced {
-            return QUOTA_EXCEEDED;
+        let free = storage::disk_free(root);
+        if let Some(hr) = no_room(written as u64, replaced, used_bytes(root), free) {
+            return hr;
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
@@ -786,6 +805,11 @@ extern "system" fn read_result(
 ) -> HRESULT {
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
+    // The documented error for a small buffer; the result stays for a
+    // retry with a larger one.
+    if hr == xasync::E_NOT_SUFFICIENT_BUFFER {
+        return BUFFER_TOO_SMALL;
+    }
     if hr < 0 {
         return hr;
     }
@@ -943,6 +967,17 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
         }
+    }
+
+    /// The per-user quota and the host disk fail with their own errors.
+    #[test]
+    fn a_full_disk_is_not_the_quota() {
+        let mb = 1 << 20;
+        assert_eq!(no_room(2 * mb, 0, 0, mb), Some(OUT_OF_LOCAL_STORAGE));
+        assert_eq!(no_room(2 * mb, 0, QUOTA - mb, 100 * mb), Some(QUOTA_EXCEEDED));
+        // Replacing a blob of the same size fits a full quota.
+        assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
+        assert_eq!(no_room(mb, 0, 0, mb), None);
     }
 
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {
@@ -1108,6 +1143,31 @@ mod tests {
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
     }
 
+    /// An empty configuration id names none. As a folder name it would be
+    /// the folder every configuration lives in, whose folders then look
+    /// like containers of the old layout and are converted away.
+    #[test]
+    fn an_empty_configuration_id_is_the_default_one() {
+        let saves = tempfile::tempdir().unwrap();
+        let scid = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert_eq!(update(&scid.root, "one", &[("a", Some("kept"))]), S_OK);
+        let kept = Some(("one".into(), vec![("a".into(), "kept".into())]));
+        assert_eq!(state(&scid.root), kept);
+
+        let empty = Provider::open(saves.path(), Some("")).unwrap();
+        assert!(scid.root.is_dir(), "another configuration's saves are gone");
+        assert_eq!(state(&scid.root), kept);
+        let default = Provider::open(saves.path(), None).unwrap();
+        assert_eq!(empty.root, default.root);
+
+        // Named configurations stay apart, from it and from each other.
+        assert_ne!(empty.root, scid.root);
+        assert_eq!(state(&empty.root), None);
+        let other = Provider::open(saves.path(), Some("other")).unwrap();
+        assert_eq!(state(&other.root), None);
+        assert_eq!(state(&scid.root), kept);
+    }
+
     #[test]
     fn saves_persist_across_providers() {
         let this: This = &OBJECT;
@@ -1209,6 +1269,10 @@ mod tests {
         );
         let mut buffer = vec![0u64; size.div_ceil(8)];
         let mut count = 0;
+        assert_eq!(
+            read_result(this, &mut b, 8, buffer.as_mut_ptr().cast(), &mut count),
+            BUFFER_TOO_SMALL
+        );
         assert_eq!(
             read_result(this, &mut b, size, buffer.as_mut_ptr().cast(), &mut count),
             S_OK
