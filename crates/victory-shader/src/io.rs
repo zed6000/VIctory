@@ -330,6 +330,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    let mut first_halves = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -343,7 +344,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => first_halves.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -363,7 +364,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        first_halves.push((site, attribute(inst, &v.src[0])?));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -419,6 +422,125 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 }
                 _ => {}
             }
+        }
+    }
+    if first_halves.is_empty() {
+        return Ok(io);
+    }
+    // A loaded i/j pair normally becomes one host interpolation: its first
+    // half need not be evaluated. A first half also read as data (or used
+    // without a second half) must keep P0 + i * P10. Follow phi uses too,
+    // without forcing ordinary pairs to read per-vertex attributes.
+    let folded: std::collections::HashSet<_> = io
+        .interps
+        .iter()
+        .filter_map(|(s, i)| matches!(i, Interp::Interpolated { .. }).then_some(*s))
+        .collect();
+    let entry = |reg| p.inputs.iter().find(|r| r.0 == reg).map(|r| r.1);
+    let reads: Vec<Vec<Vec<Value>>> = p
+        .blocks
+        .iter()
+        .map(|block| {
+            block
+                .insts
+                .iter()
+                .map(|inst| {
+                    // IR also records the old VGPR destination for EXEC preservation.
+                    // An ordinary full-word move under unchanged entry EXEC does not
+                    // consume it. Masked, DPP and SDWA moves must retain that dependency.
+                    let overwrite = match &inst.fields {
+                        Fields::Valu(v)
+                            if inst.name() == "v_mov_b32"
+                                && v.dpp.is_none()
+                                && v.sdwa.is_none()
+                                && entry(Reg::S(crate::ir::EXEC)).is_some()
+                                && inst.read(Reg::S(crate::ir::EXEC))
+                                    == entry(Reg::S(crate::ir::EXEC))
+                                && (!native.wave64
+                                    || inst.read(Reg::S(crate::ir::EXEC + 1))
+                                        == entry(Reg::S(crate::ir::EXEC + 1))) =>
+                        {
+                            match v.dst {
+                                Some(Operand::Vector { reg, .. })
+                                    if !v.src.iter().any(|s| {
+                                        matches!(*s, Operand::Vector { reg: first, dwords }
+                                if u16::from(reg) >= u16::from(first)
+                                    && u16::from(reg) < u16::from(first) + u16::from(dwords))
+                                    }) =>
+                                {
+                                    Some(Reg::V(reg))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    inst.reads
+                        .iter()
+                        .filter(|r| Some(r.0) != overwrite)
+                        .map(|r| r.1)
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    let mut used = std::collections::HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            // Effects need their operands. Scalar writes may feed a branch;
+            // conservatively retain them even when its control use is implicit.
+            if matches!(inst.fields, Fields::Exp { .. })
+                || inst.name().contains("store")
+                || inst.name().contains("atomic")
+                || inst
+                    .writes
+                    .iter()
+                    .any(|w| matches!(w.0, Reg::S(_) | Reg::Scc))
+            {
+                used.extend(reads[b][i].iter().copied());
+            }
+        }
+    }
+    loop {
+        let before = used.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if used.contains(&phi.value) {
+                used.extend(&phi.args);
+            }
+        }
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                if !inst.writes.iter().any(|w| used.contains(&w.1)) {
+                    continue;
+                }
+                if folded.contains(&(b, i)) {
+                    // Folding replaces the pair's arithmetic inputs, but f16 p2
+                    // still preserves the old destination's upper 16 bits. This
+                    // may differ from the pair's explicit accumulator VGPR.
+                    if inst.name() == "v_interp_p2_f16"
+                        && let Fields::Valu(v) = &inst.fields
+                        && let Some(Operand::Vector { reg, .. }) = v.dst
+                        && let Some(old) = inst.read(Reg::V(reg))
+                    {
+                        used.insert(old);
+                    }
+                } else {
+                    used.extend(reads[b][i].iter().copied());
+                }
+            }
+        }
+        if used.len() == before {
+            break;
+        }
+    }
+    for (site, attribute) in first_halves {
+        if !io.interps.iter().any(|(s, _)| *s == site)
+            && p.blocks[site.0].insts[site.1]
+                .writes
+                .iter()
+                .any(|w| used.contains(&w.1))
+        {
+            io.interps.push((site, Interp::Weighted { attribute }));
         }
     }
     Ok(io)
@@ -684,6 +806,50 @@ mod tests {
                 ((0, 2), Interp::Weighted { attribute }),
             ]
         );
+    }
+
+    #[test]
+    fn first_halves_read_through_a_phi_keep_their_partial_values() {
+        let p = program(&[
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> second first half
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xBF82_0001, // s_branch -> export
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 2);
+        assert!(
+            io.interps
+                .iter()
+                .all(|(_, i)| matches!(i, Interp::Weighted { .. }))
+        );
+    }
+
+    #[test]
+    fn a_standalone_f16_first_half_is_weighted() {
+        let p = program(&[
+            0xD742_0002,
+            0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202,
+            S_ENDPGM,
+        ]);
+        let io = raise(
+            &p,
+            &pixel(
+                vec![PsInput {
+                    fp16: true,
+                    ..TEXCOORD
+                }],
+                2,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(&io.interps[..], [(_, Interp::Weighted { .. })]));
     }
 
     #[test]
