@@ -138,6 +138,11 @@ pub enum Interp {
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
+    /// A half of an interpolation whose i or j is computed rather than
+    /// loaded: each half evaluates as the hardware does, from the
+    /// attribute's vertex values (`v_interp_p1*`: P0 + i P10, with P10 =
+    /// P1 - P0; `v_interp_p2*`: its old dst + j P20, with P20 = P2 - P0).
+    Weighted { attribute: Attribute },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,7 +350,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                     &barycentric,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
-                            io.interps.push((site, interp.with(attribute)));
+                            push_pair(&mut io, site, interp, attribute);
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
@@ -361,7 +366,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         let interp = halves
                             .pair(&v.src[0], read(2), read(1), &barycentric)
                             .map_err(|what| unsupported(at, what))?;
-                        io.interps.push((site, interp.with(attribute)));
+                        push_pair(&mut io, site, interp, attribute);
                     }
                     _ => return Err(unsupported(at, "an interpolation form")),
                 },
@@ -432,20 +437,37 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
     out
 }
 
-/// An interpolation before its attribute is known.
+/// An interpolation before its attribute is known: `barycentric` none
+/// when i or j is computed.
 struct Pair {
-    barycentric: Barycentric,
+    barycentric: Option<Barycentric>,
     first: Vec<Site>,
 }
 
 impl Pair {
     fn with(self, attribute: Attribute) -> Interp {
-        Interp::Interpolated {
-            attribute,
-            barycentric: self.barycentric,
-            first: self.first,
+        match self.barycentric {
+            Some(barycentric) => Interp::Interpolated {
+                attribute,
+                barycentric,
+                first: self.first,
+            },
+            None => Interp::Weighted { attribute },
         }
     }
+}
+
+/// Records interpolation `pair` at `site`, and its first halves too when
+/// they evaluate on their own (computed barycentrics).
+fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute) {
+    if pair.barycentric.is_none() {
+        for &f in &pair.first {
+            if !io.interps.iter().any(|(s, _)| *s == f) {
+                io.interps.push((f, Interp::Weighted { attribute }));
+            }
+        }
+    }
+    io.interps.push((site, pair.with(attribute)));
 }
 
 /// Finds the first halves of interpolations.
@@ -458,7 +480,9 @@ struct Halves<'a> {
 impl Halves<'_> {
     /// The interpolation whose second half reads the first half's result
     /// `acc`, the barycentric `j`, and attribute `attr`: every first half
-    /// must read the same attribute channel and the same kind's i.
+    /// must read the same attribute channel. With j and every first half's
+    /// i loaded as one kind's, the pair interpolates with that kind;
+    /// otherwise each half evaluates on its own (`Interp::Weighted`).
     fn pair(
         &self,
         attr: &Operand,
@@ -472,8 +496,9 @@ impl Halves<'_> {
             &mut Vec::new(),
             &mut first,
         )?;
-        let Some((kind, 1)) = barycentric(j) else {
-            return Err("an interpolation with computed barycentrics");
+        let mut kind = match barycentric(j) {
+            Some((kind, 1)) => Some(kind),
+            _ => None,
         };
         for &(b, i) in &first {
             let inst = &self.p.blocks[b].insts[i];
@@ -492,8 +517,8 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if barycentric(i) != Some((kind, 0)) {
-                return Err("an interpolation with computed barycentrics");
+            if kind.is_some_and(|k| barycentric(i) != Some((k, 0))) {
+                kind = None;
             }
         }
         Ok(Pair {
@@ -625,6 +650,33 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn computed_barycentrics_evaluate_each_half() {
+        // i scaled before the first half: both halves stand on their own.
+        let p = program(&[
+            0x1006_00F0, // v_mul_f32 v3, 0.5, v0
+            0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        let attribute = Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel: 0,
+            high: false,
+        };
+        let mut interps = io.interps.clone();
+        interps.sort_by_key(|i| i.0);
+        assert_eq!(
+            interps,
+            [
+                ((0, 1), Interp::Weighted { attribute }),
+                ((0, 2), Interp::Weighted { attribute }),
+            ]
+        );
     }
 
     #[test]
