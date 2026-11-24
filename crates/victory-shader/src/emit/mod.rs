@@ -757,8 +757,10 @@ mod barycentric_tests {
     use super::*;
     use crate::native::{PsInput, StageIo, Usage};
 
-    /// `SPI_PS_INPUT_ADDR` bits: PERSP_CENTER, LINEAR_CENTER.
+    /// `SPI_PS_INPUT_ADDR` bits: PERSP_CENTER, PERSP_CENTROID,
+    /// LINEAR_CENTER.
     const PERSP_CENTER: u32 = 1 << 1;
+    const PERSP_CENTROID: u32 = 1 << 2;
     const LINEAR_CENTER: u32 = 1 << 5;
 
     /// `exp mrt0, v<r>, v<r>, v<r>, v<r> done vm`.
@@ -883,6 +885,31 @@ mod barycentric_tests {
             .collect();
         indices.sort();
         assert_eq!(indices, [0, 1], "{inputs:?}");
+        validate(&shader);
+    }
+
+    /// Center and centroid perspective I/J both read as values: DXIL
+    /// allows one perspective `SV_Barycentrics` element (the validator:
+    /// "There can only be up to two input attributes of SV_Barycentrics
+    /// with different perspective interpolation mode"), so the program is
+    /// refused rather than given two, or center weights for centroid ones.
+    #[test]
+    fn center_and_centroid_barycentrics_are_refused() {
+        // v0-v1 perspective center i, j; v2-v3 perspective centroid i, j.
+        let [e0, e1] = exp_mrt0(4);
+        let words = [v_add_f32(4, 0, 3), e0, e1, 0xBF81_0000];
+        match pixel(&words, PERSP_CENTER | PERSP_CENTROID) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert!(what.contains("two perspective modes"), "{what}")
+            }
+            Err(e) => panic!("{e:?}"),
+            Ok(shader) => panic!("translated: {:?}", parts(&shader).1),
+        }
+        // Centroid alone (v2, v3) still translates, with one element.
+        let words = [v_add_f32(4, 2, 3), e0, e1, 0xBF81_0000];
+        let shader = pixel(&words, PERSP_CENTER | PERSP_CENTROID).unwrap();
+        let (_, inputs) = parts(&shader);
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
         validate(&shader);
     }
 

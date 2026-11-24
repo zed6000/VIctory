@@ -1188,8 +1188,23 @@ impl<'a> Lower<'a> {
             return Val::Missing("pull-model barycentrics");
         }
         // One element per interpolation mode (the console's own, if its
-        // signature declares one): DXIL allows two.
+        // signature declares one). DXIL allows two, one perspective and
+        // one linear: a second perspective (or linear) mode is refused,
+        // since its weights differ from the first's where the modes'
+        // sample points do (centroid weights stay inside the triangle,
+        // center ones need not), so reusing the declared element would
+        // be a silent wrong value.
         let bary = |e: &SigElement| e.kind == 28;
+        let clash = self.s.inputs.iter().any(|e| {
+            bary(e) && e.usage != 0 && e.interp != mode && linear(e.interp) == linear(mode)
+        });
+        if clash {
+            return Val::Missing(if linear(mode) {
+                "barycentrics of two linear modes (SV_Barycentrics allows one)"
+            } else {
+                "barycentrics of two perspective modes (SV_Barycentrics allows one)"
+            });
+        }
         let id = match self
             .s
             .inputs
@@ -7206,6 +7221,11 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether DXIL interpolation mode `mode` is a linear (noperspective) one.
+fn linear(mode: u8) -> bool {
+    matches!(mode, 4 | 5 | 7)
 }
 
 /// The DXIL interpolation mode of a kind of barycentrics (none for the
