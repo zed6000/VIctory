@@ -94,8 +94,18 @@ pub(crate) enum C {
     MarkedUs,
     MarkedKept,
     SavedPages,
+    /// Preparing submissions: descriptors the title copied into its heaps
+    /// as bytes, made on the host first.
+    SyncHeapsUs,
+    /// Of those: heap slots looked at (every slot of each page written).
+    SyncSlots,
+    /// Time in copies redone piece by piece after meeting an unmapped page.
+    FallbackUs,
+    /// Title threads writing a view into a shader-visible heap: time
+    /// waiting for the heaps' lock (held by heap syncs and other writers).
+    MirrorWaitUs,
 }
-const COUNTERS: usize = 57;
+const COUNTERS: usize = 61;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -217,14 +227,14 @@ pub(crate) fn log(frames: f64) {
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
+         unchanged; {:.1} fallbacks ({:.1} ms); {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed; watch time: kernel {:.1} ms, view queries {:.1} ms, protecting {:.1} ms; copied whole (not tracked) {:.1} MB in {:.1} ms; snapshots {:.1} MB in {:.1} ms; page faults {:.0} preparing, {:.0} copying back; {:.0} tracked pages marked through another mapping; \
          guards: {:.2} ms in the handler, {:.0} protect calls for {:.0} pages, {:.0} pages opened; \
          {:.0} tracked pages written ({:.0} of them the frame before too); change checks: {:.1} ms \
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
-         heap texture uploads {:.1} ms, state preludes {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
+         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
          {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -245,6 +255,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
+        ms(c[C::FallbackUs as usize]),
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
@@ -277,6 +288,9 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::StepMemoryUs as usize]),
         ms(c[C::UploadsUs as usize]),
         ms(c[C::PreludeUs as usize]),
+        ms(c[C::SyncHeapsUs as usize]),
+        c[C::SyncSlots as usize],
+        ms(c[C::MirrorWaitUs as usize]),
         mb(c[C::CompareBytes as usize]),
         ms(c[C::CompareUs as usize]),
         c[C::MarkedPages as usize],
@@ -321,5 +335,85 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+}
+
+/// A global allocator that counts the bytes Rust code holds (the
+/// statistics' "our heap"; the binary installs it in diagnostics builds).
+pub struct CountingAlloc;
+
+/// Bytes [`CountingAlloc`] has handed out and not taken back.
+pub(crate) static HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Allocations of at least this many bytes name their caller, once per
+/// power-of-two size class (who holds the big blocks of our heap).
+const LARGE: usize = 32 << 20;
+
+/// Logs the stack of a large allocation of `size` bytes, the first of its
+/// size class.
+fn note_large(size: usize) {
+    static SEEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    std::thread_local!(static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    let class = 1u64 << size.ilog2().min(63);
+    if INSIDE.with(|i| i.replace(true)) {
+        return;
+    }
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let first = *seen & class == 0;
+        *seen |= class;
+        first
+    };
+    if first {
+        let trace = std::backtrace::Backtrace::force_capture().to_string();
+        let frames: Vec<&str> = trace.lines().filter(|l| l.contains("victory")).take(24).collect();
+        tracing::info!(mb = size >> 20, "a large heap allocation (first of its size class): {}", frames.join(" | "));
+    }
+    INSIDE.with(|i| i.set(false));
+}
+
+// SAFETY: every call goes to the system allocator unchanged; only counted.
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's layout, passed on.
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
+            if layout.size() >= LARGE {
+                note_large(layout.size());
+            }
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: as above.
+        let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
+            if layout.size() >= LARGE {
+                note_large(layout.size());
+            }
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
+        HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
+        // SAFETY: a block this allocator handed out with this layout.
+        unsafe { std::alloc::System.dealloc(p, layout) }
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        // SAFETY: as above.
+        let q = unsafe { std::alloc::System.realloc(p, layout, size) };
+        if !q.is_null() {
+            HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
+            HEAP_BYTES.fetch_add(size as u64, Relaxed);
+            if size >= LARGE {
+                note_large(size);
+            }
+        }
+        q
     }
 }

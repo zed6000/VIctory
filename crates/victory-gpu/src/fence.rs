@@ -1,5 +1,5 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and the events waiting for it, moved by the
+//! title's Signals and its queues' (once the work before them has run).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
@@ -35,8 +35,9 @@ struct Fence {
     /// address.
     value: AtomicU64,
     flags: u32,
-    /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    /// Events to set once the value reaches theirs (handles as integers),
+    /// and since when.
+    waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -83,9 +84,12 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 extern "system" fn completed(this: This) -> u64 {
+    // A title polling for a value: held work that may run now does first.
+    crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
@@ -100,21 +104,58 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
 }
-pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+/// The title's Signal from the CPU: what queues hold behind a Wait for it
+/// may run now (`crate::hold`).
+extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    let hr = set(this, value);
+    crate::queue::pump_held(crate::queue::Why::Fence);
+    hr
+}
+
+/// Moves a fence to `value` and wakes the events waiting for it (a queue's
+/// Signal, when the work before it has run).
+pub(crate) fn set(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, since)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
+            WAITED.0.fetch_add(1, Ordering::Relaxed);
+            WAITED.1.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         !reached
     });
     S_OK
+}
+
+/// Events the title waited on for a fence value, and their summed waits in
+/// microseconds (the held-work frame line: work held back shows here as the
+/// title's own waits).
+static WAITED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+
+/// Events set since the last call and how long they waited, summed.
+pub(crate) fn take_waited() -> (u64, std::time::Duration) {
+    let n = WAITED.0.swap(0, Ordering::Relaxed);
+    (n, std::time::Duration::from_micros(WAITED.1.swap(0, Ordering::Relaxed)))
+}
+
+/// A fence's value.
+pub(crate) fn value(this: This) -> u64 {
+    fence(this).value.load(Ordering::Acquire)
+}
+
+/// Keeps a fence alive while a queue holds a Signal of it, until
+/// [`let_go`].
+pub(crate) fn keep(this: This) {
+    object::add_ref(this);
+}
+pub(crate) fn let_go(this: This) {
+    release(this);
 }
 
 extern "system" fn creation_flags(this: This) -> u32 {

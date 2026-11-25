@@ -252,6 +252,29 @@ const PS_CASES: &[(&str, &str)] = &[
             return float4(ddx_fine(v), ddy_fine(v), v, 1);
         }"#,
     ),
+    // Derivatives and quad reads of values each pixel computes, on a
+    // triangle whose edge crosses quads: the neighbours outside it are
+    // helpers (`EDGE`).
+    (
+        "derivatives and quad reads across a triangle edge",
+        r#"[RootSignature(RS)] float4 ps(V i) : SV_Target {
+            uint2 p = uint2(i.pos.xy);
+            float v = p.x * 3.0 + p.y * 5.0 + 1;
+            v = v * v;
+            return float4(ddx_fine(v), ddy_fine(v), QuadReadAcrossDiagonal(v), QuadReadLaneAt(v, 0));
+        }"#,
+    ),
+    // The same with some neighbours discarded before the reads: helpers too.
+    (
+        "discard, then derivatives and quad reads across a triangle edge",
+        r#"[RootSignature(RS)] float4 ps(V i) : SV_Target {
+            uint2 p = uint2(i.pos.xy);
+            float v = p.x * 3.0 + p.y * 5.0 + 1;
+            v = v * v;
+            if (((p.x * 7 + p.y * 3) & 5) == 5) discard;
+            return float4(ddx_fine(v), ddy_fine(v), QuadReadAcrossDiagonal(v), QuadReadLaneAt(v, 0));
+        }"#,
+    ),
     (
         "discard with depth and a second target",
         r#"struct O { float4 c : SV_Target0; float4 d : SV_Target1; float z : SV_Depth; };
@@ -267,6 +290,9 @@ const PS_CASES: &[(&str, &str)] = &[
         }"#,
     ),
 ];
+
+/// Pixel cases named with this draw a triangle whose edge crosses quads.
+const EDGE: &str = "triangle edge";
 
 /// Per-lane inputs: four dwords per lane from a fixed hash (low bits vary
 /// lane to lane; a few lanes hold larger values).
@@ -441,17 +467,23 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
                 ));
             }
         }
-        // Pixel shapes.
+        // Pixel shapes: a triangle covering the target, or for cases named
+        // with `EDGE` one whose diagonal crosses quads.
         let vertices = [
             -1.0, -1.0, 0.5, 1.0, 0.0, 1.0, //
             -1.0, 3.0, 0.5, 1.0, 0.0, -1.0, //
             3.0, -1.0, 0.5, 1.0, 2.0, 1.0,
         ];
-        let draw = |roots| Draw {
+        let half = [
+            -1.0, -1.0, 0.5, 1.0, 0.0, 1.0, //
+            -1.0, 1.1, 0.5, 1.0, 0.0, -0.05, //
+            1.1, -1.0, 0.5, 1.0, 1.05, 1.0,
+        ];
+        let draw = |roots, edge: bool| Draw {
             roots,
             textures: &[],
             samplers: &[],
-            vertices: &vertices,
+            vertices: if edge { &half } else { &vertices },
             stride: 24,
             size: (16, 16),
             mesh_groups: 0,
@@ -481,10 +513,13 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
                 .draw(
                     &root_t,
                     &pso_t,
-                    &draw(vec![
-                        (0, Root::Constants(console_user_data(&vs_c))),
-                        (1, Root::Constants(console_user_data(&ps_c))),
-                    ]),
+                    &draw(
+                        vec![
+                            (0, Root::Constants(console_user_data(&vs_c))),
+                            (1, Root::Constants(console_user_data(&ps_c))),
+                        ],
+                        name.contains(EDGE),
+                    ),
                 )
                 .unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
             let (vs_p, ps_p) = (
@@ -499,7 +534,7 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
                 .draw(
                     &root_p,
                     &pso_p,
-                    &draw(vec![(0, Root::Constants(vec![0; 4]))]),
+                    &draw(vec![(0, Root::Constants(vec![0; 4]))], name.contains(EDGE)),
                 )
                 .unwrap();
             let bad: Vec<usize> = (0..got.len()).filter(|&t| got[t] != want[t]).collect();

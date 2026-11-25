@@ -1483,17 +1483,19 @@ fn translated_compute_matches_pc() {
             }
             Err(e) => panic!("{name}: {e}"),
         };
-        // Our root views follow the user data in root parameter order.
+        // Our root views follow the user data in root parameter order: the
+        // case's own, then the host's view-stride table (16-bit typed
+        // accesses read their view's format kind there).
         let mut roots = vec![(0, Root::Constants(user_data(&cs_c, &k)))];
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-            let data = if srv {
-                root_srv.clone()
+            let data = if srv && slot == super::VIEW_STRIDES {
+                super::host::view_strides(&views)
             } else {
-                root_cbv.clone()
+                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+                if srv { root_srv.clone() } else { root_cbv.clone() }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }

@@ -1239,6 +1239,9 @@ pub enum View<'a> {
     Uint2TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV in this format, of this many elements of this many
+    /// bytes, zeroed.
+    TypedUav(DXGI_FORMAT, u32, u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1255,6 +1258,34 @@ pub enum View<'a> {
     /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
     /// below it.
     NullBuffers,
+}
+
+/// The host's view-stride table (`t`[`super::VIEW_STRIDES`]) for a view
+/// heap of `views`, as `victory_gpu` fills it: per slot the element size of
+/// a buffer view (4 for raw ones), with [`super::VIEW_INTEGER`] (and
+/// [`super::VIEW_SIGNED`]) for typed views of integer formats; 0 elsewhere.
+#[cfg(test)]
+pub fn view_strides(views: &[View]) -> Vec<u32> {
+    let kind = |f: DXGI_FORMAT| match f {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R10G10B10A2_UINT | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R16G16_UINT
+        | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
+        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R32G32_SINT
+        | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_SINT
+        | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
+        _ => 0,
+    };
+    views
+        .iter()
+        .map(|v| match *v {
+            View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
+            View::Buffer { stride: Stride::Typed, .. } => 16,
+            View::Buffer { stride: Stride::Structured(n), .. } => n,
+            View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
+            View::HalfUav(_) => 8,
+            _ => 0,
+        })
+        .collect()
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1402,6 +1433,32 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
+            // Zeros a UAV made as a copy destination (`size`: a texture's,
+            // `n` its words per texel, else a buffer's dwords) and returns
+            // the upload buffer to keep. A new committed resource is not
+            // always zeroed: WARP hands out memory a freed buffer of ours held.
+            let zero = |r: &ID3D12Resource, size: Option<(u32, u32)>, n: u32| {
+                let zeros = match size {
+                    Some((w, h)) => {
+                        let pitch = (w * 4 * n).next_multiple_of(256);
+                        let zeros = upload(&vec![0; (pitch * h / 4) as usize])?;
+                        let from = footprint_as(&zeros, w, h, n);
+                        list.CopyTextureRegion(&subresource(r), 0, 0, 0, &from, None);
+                        zeros
+                    }
+                    None => {
+                        let zeros = upload(&vec![0; n as usize])?;
+                        list.CopyBufferRegion(r, 0, &zeros, 0, u64::from(n) * 4);
+                        zeros
+                    }
+                };
+                list.ResourceBarrier(&[transition(
+                    r,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                Ok::<_, String>(zeros)
+            };
             let slots = match d.views.last() {
                 Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
                 _ => d.views.len(),
@@ -1543,7 +1600,7 @@ impl Host {
                         dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::TypedUav(..) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1552,6 +1609,9 @@ impl Host {
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
+                            View::TypedUav(format, e, bytes) => {
+                                ((e * bytes).div_ceil(4), format, e, D3D12_BUFFER_UAV_FLAG_NONE)
+                            }
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
@@ -1561,7 +1621,7 @@ impl Host {
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
@@ -1575,6 +1635,7 @@ impl Host {
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        keep.push(zero(&b, None, n)?);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1586,9 +1647,10 @@ impl Host {
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &texture(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
+                        keep.push(zero(&t, Some((w, h)), 4)?);
                         let pitch = (w * 16).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1605,9 +1667,10 @@ impl Host {
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
+                        keep.push(zero(&t, Some((w, h)), words)?);
                         let pitch = (w * 4 * words).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
@@ -1805,9 +1868,10 @@ impl Host {
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        keep.push(zero(&b, None, n)?);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
@@ -1820,7 +1884,6 @@ impl Host {
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
             for (r, size, n, rb) in &uavs {
-                // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
                     r,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

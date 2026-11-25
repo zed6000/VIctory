@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -50,10 +50,10 @@ pub(crate) struct HostHeap {
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
-    /// Per title slot, the title address of the buffer view it holds, as a
-    /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
-    /// address as data, `crate::memory`): the buffer, its mapping and host
-    /// address, made on first use.
+    /// Per title slot, the console descriptor's dwords 0-3 as far as the
+    /// host knows them (shaders reading a descriptor as data, `crate::memory`;
+    /// [`write_address`]): the buffer, its mapping and host address, made on
+    /// first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
@@ -468,9 +468,10 @@ impl HostHeap {
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
-    /// for slot `index` in the view-stride table.
+    /// for slot `index` in the view-stride table, with the integer-format
+    /// bits of a typed buffer view ([`view_kind`]).
     fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, view_stride));
+        self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)));
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
@@ -541,7 +542,7 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -627,6 +628,34 @@ impl HostHeap {
         }
     }
 
+    /// A heap sync of slots `first..last`, whose records are at `start` +
+    /// index × `step`: [`HostHeap::mirror`] of each slot whose record
+    /// differs from what the slot holds, the rest passed by as `mirror`
+    /// would, with one lock of each kind for them all instead of two per slot
+    /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
+    pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        let at = |i: u32| start + u64::from(i) * step;
+        // SAFETY: records in title heap memory the caller found mapped.
+        let records: Vec<[u32; 3]> =
+            (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
+        let current = views_current(&records);
+        let stale: Vec<u32> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            (first..last)
+                .zip(records.iter().zip(current))
+                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
+                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
+                    Some(&m) => m != 0,
+                    None => true,
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        for i in stale {
+            self.mirror(i, at(i), false);
+        }
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -662,17 +691,50 @@ impl HostHeap {
             }
             return None;
         };
-        if made[index as usize] != key {
+        // A placed texture's view left null below is made when a draw reads
+        // the slot through a table; until then the slot is not made again
+        // (heap syncs revisit it at every submission).
+        let lazy = || {
+            for_draw
+                && is_texture(&view)
+                && self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_none()
+        };
+        if made[index as usize] == key && !lazy() {
+            return Some(view);
+        }
+        // Shaders index the heap itself (`crate::bindless`): buffer views
+        // are made when written.
+        // shortcut: views of textures the title placed itself are made
+        // when a draw reads them through a table: a host texture (and a
+        // staging copy) for each of the ~20,000 the title has views of
+        // ran the host out of memory (run b2).
+        let later = !for_draw && is_placed_texture(&view);
+        if !later {
+            // What the view needs (the texture it views, the copy of the
+            // memory) is made without the slot lock, which title threads
+            // binding and writing views wait on (run evict5).
+            drop(made);
+            prepare(&view);
+            made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            // The title may have written another record there meanwhile (and
+            // another thread made it): that one is the slot's.
+            // SAFETY: as above.
+            if unsafe { (handle as *const [u32; 3]).read_unaligned() } != [tag, i, generation] {
+                drop(made);
+                return self.mirror(index, handle, for_draw);
+            }
+            if made[index as usize] == key && !lazy() {
+                return Some(view);
+            }
+        }
+        {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
-            // Shaders index the heap itself (`crate::bindless`): buffer views
-            // are made when written.
-            // shortcut: views of textures the title placed itself are made
-            // when a draw reads them through a table: a host texture (and a
-            // staging copy) for each of the ~20,000 the title has views of
-            // ran the host out of memory (run b2).
-            let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
+            if later {
+                // Made once a shader reads it (`crate::shadow::take_reads`).
+                crate::shadow::forget_read(index);
+            }
+            made[index as usize] = key;
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -711,10 +773,88 @@ impl HostHeap {
         Some(text)
     }
 
+    /// Slots viewing one of the host textures `textures` (raw pointers),
+    /// which are given up: each gets a null view of its kind and holds the
+    /// texture no more (retired until the running submission has run), its
+    /// record stays noted so heap syncs leave it, and the next draw reading
+    /// it through a table or shader reading it through the heap (its read
+    /// mark, cleared) makes it again.
+    /// The slots are found by a walk of the heap, once per pass that gives
+    /// textures up: a map of each texture's slots, kept at every slot the
+    /// title rewrote, cost ~25 us a slot (a texture viewed in thousands of
+    /// slots had its list searched each time; 62,000 slots a frame, run
+    /// evict3).
+    pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
+        let slots: Vec<u32> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            (0..kept.len() as u32)
+                .filter(|&i| {
+                    kept[i as usize]
+                        .as_ref()
+                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                })
+                .collect()
+        };
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        for index in slots {
+            let key = made.get(index as usize).copied().unwrap_or(0);
+            let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+            match &view {
+                Some(v) => null_for(v, self.cpu(index)),
+                None => null_view(self.cpu(index)),
+            }
+            self.keep(index, None);
+            if index < self.count {
+                self.viewed.set(index, view.as_ref(), false);
+                crate::shadow::forget_read(index);
+            }
+        }
+    }
+
+    /// The host textures (raw pointers) slots `slots` view.
+    pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .iter()
+            .filter_map(|&i| kept.get(i as usize)?.as_ref().filter(|k| k.1.is_none()))
+            .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
+            .collect()
+    }
+
+    /// The view of slot `index` if it is a placed texture's left without a
+    /// host view (made when read).
+    pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
+        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        (is_placed_texture(&view) && !kept).then_some(view)
+    }
+
+    /// A shader read slot `index` through the heap: the texture it views
+    /// was used now.
+    pub(crate) fn stamp_read(&self, index: u32) {
+        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
+        let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
+            return;
+        };
+        let view = placed_texture(&view).unwrap_or(view);
+        if let View::Shader(r, _) = view
+            && let Some(t) = crate::resource::made_copy(r as crate::object::This)
+        {
+            t.stamp();
+        }
+    }
+
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+    }
+
+    /// Whether slot `index` holds a host view of a resource (tests).
+    #[cfg(test)]
+    pub(crate) fn kept(&self, index: u32) -> bool {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
     }
 }
 
@@ -788,6 +928,51 @@ fn view_stride(view: &View) -> u32 {
     element.max(1) as u32
 }
 
+/// The view-stride table's format-kind bits of a buffer view: a typed view
+/// (no structure stride, not raw) of an integer format gets
+/// `VIEW_INTEGER`, a signed one also `VIEW_SIGNED`; anything else none.
+/// Translated shaders pass 16-bit typed data of such views as bits, not as
+/// halves (`victory_shader::emit`, "d16").
+fn view_kind(view: &View) -> u32 {
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return 0,
+        },
+        _ => return 0,
+    };
+    // Buffer views only (dimension 1); a structured or raw one is no typed view.
+    let (format, typed) = if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 == 0)
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        (desc.Format.0 as u32, b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0)
+    };
+    match (words[1] == 1 && typed).then(|| integer_format(format)).flatten() {
+        Some(true) => VIEW_INTEGER | VIEW_SIGNED,
+        Some(false) => VIEW_INTEGER,
+        None => 0,
+    }
+}
+
+/// Whether a DXGI format is an integer one, and if so whether signed:
+/// `Some(false)` for `UINT`, `Some(true)` for `SINT`, `None` otherwise.
+fn integer_format(format: u32) -> Option<bool> {
+    match format {
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => Some(false),
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => Some(true),
+        _ => None,
+    }
+}
+
 /// A buffer view of title memory at `address` on its host copy: the first
 /// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
@@ -803,14 +988,83 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s view address into the view addresses at `data`:
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
+/// Writes slot `index`'s words into the view addresses at `data`, 16 bytes
+/// a slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
+/// high), a texture view's size fields ([`texture_words`]), zeros for
+/// anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
     let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+    let words = match view.and_then(texture_words) {
+        Some(words) => words,
+        None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
+    };
+    // SAFETY: the mapped view addresses hold 16 bytes per title slot.
+    unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+}
+
+/// A texture view's console image descriptor dwords 0-3 as far as its size
+/// goes: width - 1 and height - 1 of the resource's level 0 (dword 1 bits
+/// 30-31, dword 2 bits 0-13 and 14-29), dword 3 an identity swizzle, the
+/// view's first and last level (bits 12-15, 16-19) and the image type (bits
+/// 28-31). `None` for buffers and samplers.
+// shortcut: the address, format and tiling fields read 0 (no translated
+// shader reads them: the shader refuses such reads where it can tell),
+// and the swizzle is the identity whatever the view's component mapping.
+fn texture_words(view: &View) -> Option<[u32; 4]> {
+    let (resource, desc, unordered) = match view {
+        View::Shader(r, desc) => (crate::resource::texture_desc(*r as crate::object::This)?, *desc, false),
+        View::Unordered(r, _, desc) => (crate::resource::texture_desc(*r as crate::object::This)?, *desc, true),
+        View::Placed(unordered, resource, desc) if resource[0] != 1 => {
+            (*resource, desc[..10].try_into().ok(), *unordered)
+        }
+        _ => return None,
+    };
+    Some(image_words(&resource, desc.as_ref(), unordered))
+}
+
+/// [`texture_words`] of a texture of resource description `resource` (as
+/// words) through a view of description `desc` (none: the resource's own).
+fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool) -> [u32; 4] {
+    let width = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+    let height = resource[6];
+    let (depth, mips) = (resource[7] & 0xFFFF, resource[7] >> 16);
+    let (samples, dimension) = (resource[9], resource[0]);
+    // Mip count 0: the whole chain.
+    let deepest = if dimension == 4 { depth } else { 1 };
+    let chain = 64 - (width.max(u64::from(height)).max(u64::from(deepest)) | 1).leading_zeros();
+    let mips = if mips == 0 { chain } else { mips };
+    // Image types: 8 1D, 9 2D, 10 3D, 11 cube, 12 1D array, 13 2D array,
+    // 14 2D MSAA, 15 2D MSAA array.
+    let (ty, first, count) = match desc {
+        // Shader and unordered view dimensions number alike up to 3D (8).
+        Some(d) => {
+            let ty = [0, 0, 8, 12, 9, 13, 14, 15, 10, 11, 11].get(d[1] as usize).copied().unwrap_or(0);
+            match (unordered, d[1]) {
+                (_, 6 | 7) => (ty, 0, 1),
+                (true, _) => (ty, d[4], 1),
+                (false, _) => (ty, d[4], if d[5] == u32::MAX { mips.saturating_sub(d[4]) } else { d[5] }),
+            }
+        }
+        None => {
+            let array = depth > 1;
+            let ty = match dimension {
+                2 if array => 12,
+                2 => 8,
+                3 if samples > 1 => 14 + u32::from(array),
+                3 => 9 + 4 * u32::from(array),
+                _ => 10,
+            };
+            (ty, 0, if unordered { 1 } else { mips })
+        }
+    };
+    let (w, h) = (width.saturating_sub(1) as u32, height.saturating_sub(1));
+    let last = first + count.max(1) - 1;
+    [
+        0,
+        (w & 3) << 30,
+        (w >> 2 & 0x3FFF) | (h & 0xFFFF) << 14,
+        0xFAC | (first & 0xF) << 12 | (last & 0xF) << 16 | ty << 28,
+    ]
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -1137,6 +1391,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
+                copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
                 let texture = &copy.texture;
                 let mut desc = desc.as_ref().map(srv_desc);
                 if desc.is_none() && !default_view(resource) {
@@ -1172,6 +1427,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
+            copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
             let texture = &copy.texture;
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
@@ -1242,6 +1498,32 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 /// Whether `view` is a view of a texture the title placed in memory itself.
 fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
+}
+
+/// Makes what a host view of `view` needs, if it is not made yet: the
+/// texture it views (made on first use) or the host copy of the buffer
+/// memory it views. The slot's view is then quick to make.
+fn prepare(view: &View) {
+    #[cfg(test)]
+    tests::while_preparing();
+    match view {
+        View::Placed(..) if is_placed_texture(view) => {
+            let _ = placed_texture(view);
+        }
+        View::Shader(r, _) | View::Unordered(r, _, _) if crate::resource::texture_memory(*r as crate::object::This).is_some() => {
+            let _ = crate::resource::host_resource(*r as crate::object::This);
+        }
+        _ => {
+            let _ = view_copy(view);
+        }
+    }
+}
+
+/// Whether `view` is a shader view of a texture (one placed in memory, or a
+/// resource object's): such a slot left null is made when read.
+fn is_texture(view: &View) -> bool {
+    is_placed_texture(view)
+        || matches!(view, View::Shader(r, _) if crate::resource::texture_memory(*r as crate::object::This).is_some())
 }
 
 /// A shader view of a texture the title placed in memory itself, as a view
@@ -1428,6 +1710,268 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// Typed buffer views of integer formats carry their kind in the
+    /// view-stride table; float, normalized, raw and structured ones none.
+    #[test]
+    fn integer_typed_buffer_views_are_marked_in_the_stride_table() {
+        use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+        // Format, dimension (buffer), first element, count, stride, counter, flags.
+        let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
+        assert_eq!(view_kind(&uav(12, 0, 0)), VIEW_INTEGER, "R16G16B16A16_UINT");
+        assert_eq!(view_kind(&uav(57, 0, 0)), VIEW_INTEGER, "R16_UINT");
+        assert_eq!(view_kind(&uav(59, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R16_SINT");
+        assert_eq!(view_kind(&uav(64, 0, 0)), VIEW_INTEGER | VIEW_SIGNED, "R8_SINT");
+        assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
+        assert_eq!(view_kind(&uav(58, 0, 0)), 0, "R16_SNORM");
+        assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
+        assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+        // Format, dimension, mapping, first element, count, stride, flags.
+        let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
+        assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
+        assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
+    }
+
+    /// A placed texture's view the title writes into a heap is left null
+    /// and noted once: heap syncs (every submission) pass it by, a draw
+    /// reading it through a table makes it.
+    #[test]
+    fn a_placed_texture_slot_left_null_is_made_once_a_draw_reads_it() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        // A 4x1 RGBA8 texture, linear, in memory of its own, and a 2D view.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        crate::descriptor::create_placed_srv(null, &words, &view, title_heap.start);
+        let host = title_heap.host().expect("a host view heap");
+        for _ in 0..2 {
+            assert!(host.mirror(0, title_heap.start, false).is_some());
+            assert!(host.made(0), "the record is noted");
+            assert!(!host.kept(0), "no host texture for it yet");
+        }
+        assert!(host.mirror(0, title_heap.start, true).is_some());
+        assert!(host.kept(0), "made for the draw");
+    }
+
+    /// A slot viewing a texture given up (`crate::resource::evict`) holds it
+    /// no more: heap syncs pass it by, a draw reading it through a table
+    /// makes it again.
+    #[test]
+    fn a_slot_viewing_a_texture_given_up_is_made_again_when_read() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        // A 4x1 RGBA8 texture, linear, in memory of its own, and a 2D view.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        crate::descriptor::create_placed_srv(null, &words, &view, title_heap.start);
+        let host = title_heap.host().expect("a host view heap");
+        assert!(host.mirror(0, title_heap.start, true).is_some());
+        assert!(host.kept(0), "made for the draw");
+        let texture = crate::resource::texture_at(address, &words).expect("its resource");
+        assert!(crate::resource::give_up_now(texture));
+        assert!(!host.kept(0), "the slot holds it no more");
+        assert!(host.made(0), "its record stays noted");
+        assert!(host.mirror(0, title_heap.start, false).is_some());
+        assert!(!host.kept(0), "heap syncs pass it by");
+        assert!(host.mirror(0, title_heap.start, true).is_some());
+        assert!(host.kept(0), "made again for the draw");
+        assert!(crate::resource::made_copy(texture).is_some(), "with a host texture again");
+    }
+
+    /// Work to run while a view's texture is prepared, once (tests).
+    pub(crate) static WHILE_PREPARING: std::sync::Mutex<Option<crate::descriptor::tests::Work>> = std::sync::Mutex::new(None);
+
+    pub(crate) fn while_preparing() {
+        let work = WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(work) = work {
+            work();
+        }
+    }
+
+    /// A record the title writes into a slot while another thread prepares
+    /// the slot's old record is the one the slot ends up viewing.
+    #[test]
+    fn a_slot_rewritten_while_its_view_is_prepared_views_the_new_record() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 1024, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let s = 960u32;
+        let at = title_heap.start + u64::from(s) * 32;
+        let memory = vec![0u8; 1 << 17];
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let view_of = |address: u64| {
+            let mut view = [0u32; 16];
+            view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            view
+        };
+        let (first, second) = (memory.as_ptr() as u64, memory.as_ptr() as u64 + (1 << 16));
+        crate::descriptor::create_placed_srv(null, &words, &view_of(first), at);
+        let host = title_heap.host().expect("a host view heap");
+        let (done, waited) = std::sync::mpsc::channel();
+        let second_view = view_of(second);
+        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+            // The title writes the other record into the slot meanwhile.
+            std::thread::spawn(move || {
+                crate::descriptor::create_placed_srv(std::ptr::null(), &words, &second_view, at);
+                done.send(()).unwrap();
+            });
+            assert!(waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the write waits");
+        }));
+        // A draw reads the slot: its first record is prepared.
+        assert!(host.mirror(s, at, true).is_some());
+        let second_texture = crate::resource::texture_at(second, &words).expect("its resource");
+        let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(second_texture).expect("made").texture) as usize;
+        assert_eq!(host.textures_at(&[s]), [raw], "the slot views the record written last");
+    }
+
+    /// What a view needs is made without the slot lock: another thread
+    /// binding a view of the same heap meanwhile is not held up.
+    #[test]
+    fn views_bound_while_another_slot_gets_its_texture_do_not_wait() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 1024, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let (first, second) = (950u32, 951u32);
+        let memory = vec![0u8; 1 << 17];
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let slot = |i: u32| title_heap.start + u64::from(i) * 32;
+        for (i, at) in [(first, 0u64), (second, 1 << 16)] {
+            let address = memory.as_ptr() as u64 + at;
+            let mut view = [0u32; 16];
+            view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            crate::descriptor::create_placed_srv(null, &words, &view, slot(i));
+        }
+        let host = title_heap.host().expect("a host view heap");
+        let heap_at = title_heap.start;
+        let heap = heap as usize;
+        let (done, waited) = std::sync::mpsc::channel();
+        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+            std::thread::spawn(move || {
+                let h = crate::descriptor::heap(heap as crate::object::This);
+                h.host().unwrap().mirror(second, heap_at + u64::from(second) * 32, true);
+                done.send(()).unwrap();
+            });
+            assert!(
+                waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+                "a view bound while another slot's texture is made waits"
+            );
+        }));
+        assert!(host.mirror(first, slot(first), true).is_some());
+        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(host.kept(first) && host.kept(second), "both made");
+    }
+
+    /// The textures of slots shaders read are made without the heaps' lock:
+    /// a title thread writing a view meanwhile is not held up by the make.
+    #[test]
+    fn views_written_while_read_slots_get_their_textures_do_not_wait() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 1024, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let (read, written) = (900u32, 901u32);
+        // A 4x1 RGBA8 texture, linear, in memory of its own, and a 2D view.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let slot = |i: u32| title_heap.start + u64::from(i) * 32;
+        crate::descriptor::create_placed_srv(null, &words, &view, slot(read));
+        let host = title_heap.host().expect("a host view heap");
+        assert!(!host.kept(read), "left null until read");
+        let (done, waited) = std::sync::mpsc::channel();
+        let at = slot(written);
+        *crate::descriptor::tests::WHILE_MAKING.lock().unwrap() = Some((
+            read,
+            Box::new(move || {
+                std::thread::spawn(move || {
+                    crate::descriptor::create_placed_srv(std::ptr::null(), &words, &view, at);
+                    done.send(()).unwrap();
+                });
+                assert!(
+                    waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+                    "a view written while a read slot's texture is made waits"
+                );
+            }),
+        ));
+        crate::descriptor::make_read(&[read]);
+        assert!(crate::descriptor::tests::WHILE_MAKING.lock().unwrap().is_none(), "the make ran");
+        assert!(host.kept(read), "made for the read");
+    }
+
+    /// A heap sync makes the slots whose records the title changed as bytes
+    /// (a copy of another slot's record, a record cleared) and passes the
+    /// others by.
+    #[test]
+    fn heap_syncs_make_the_slots_whose_records_changed() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        // A view of no memory: a view of the test's own heap memory would get
+        // a host copy whose 4 MiB window the guards may cover (the process
+        // heap guarded read-only hung the suite).
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], start);
+        let host = title_heap.host().expect("a host view heap");
+        // SAFETY: slots 0 and 1 of the heap's memory, 32 bytes each.
+        unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
+        assert!(!host.made(1), "copied as bytes: not seen yet");
+        host.sync_slots(0, 4, start, 32);
+        assert!(host.made(0) && host.made(1) && !host.made(2));
+        // SAFETY: as above.
+        unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
+        host.sync_slots(0, 4, start, 32);
+        assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+    }
+
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
@@ -1525,6 +2069,11 @@ mod tests {
             heap.make_null(slot);
             assert!(references(&buffer) >= 2, "the slot's, retired");
             crate::host::release_retired();
+            // Released on a thread of its own.
+            let since = std::time::Instant::now();
+            while references(&buffer) > 1 && since.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::yield_now();
+            }
             assert_eq!(references(&buffer), 1, "ours");
         }
         let a = heap.dynamic(heap.dynamic - 100).unwrap();
@@ -1562,5 +2111,31 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A texture view's size words are the console image descriptor's
+    /// fields: level 0's size of the resource, the view's levels, its type.
+    #[test]
+    fn a_texture_view_gives_its_image_descriptor_size_fields() {
+        // A 1000x600 2D texture of 10 levels, then an array of 6 with the
+        // whole chain (mip count 0, 1024 wide: 11 levels).
+        let mut texture = [0u32; 14];
+        (texture[0], texture[4], texture[6], texture[7], texture[9]) = (3, 1000, 600, 1 | 10 << 16, 1);
+        let mut array = texture;
+        (array[4], array[7]) = (1024, 6);
+        let mut view = [0u32; 10];
+        // Levels 2-4 of the texture: width - 1 = 999 (0b11_1110_0111).
+        (view[1], view[4], view[5]) = (4, 2, 3);
+        let words = image_words(&texture, Some(&view), false);
+        assert_eq!(words, [0, 3 << 30, 249 | 599 << 14, 0xFAC | 2 << 12 | 4 << 16 | 9 << 28]);
+        // Its whole chain from level 1.
+        (view[4], view[5]) = (1, u32::MAX);
+        assert_eq!(image_words(&texture, Some(&view), false)[3], 0xFAC | 1 << 12 | 9 << 16 | 9 << 28);
+        // An unordered view of level 3: that level alone.
+        let uav = [0, 4, 0, 0, 3, 0, 0, 0, 0, 0];
+        assert_eq!(image_words(&texture, Some(&uav), true)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
+        // The array's own view: a 2D array, levels 0-10.
+        let words = image_words(&array, None, false);
+        assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
     }
 }

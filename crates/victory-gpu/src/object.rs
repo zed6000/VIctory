@@ -71,6 +71,12 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// An object's reference count.
+pub(crate) fn refs(this: This) -> u32 {
+    // SAFETY: `this` is one of our objects.
+    unsafe { &*this }.refs.load(Ordering::Acquire)
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;

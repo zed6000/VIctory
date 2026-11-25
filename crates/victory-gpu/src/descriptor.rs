@@ -126,7 +126,11 @@ static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    #[cfg(feature = "diagnostics")]
+    let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    drop(waited);
     let Some(&(_, _, at)) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))
@@ -181,10 +185,90 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
-                    host.mirror(index as u32, start + index * step, false);
-                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    crate::copystat::C::SyncSlots,
+                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
+                );
+                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
             }
+        }
+    }
+}
+
+/// Makes the views of slots `slots` that were left null (textures the title
+/// placed itself, textures given up) in every shader-visible view heap, now
+/// that shaders read them (`crate::shadow::take_reads`), and stamps what
+/// they view as used (`crate::resource::evict`).
+#[cfg(windows)]
+pub(crate) fn make_read(slots: &[u32]) {
+    // The placed textures those slots view are made first, without the
+    // heaps' lock, which every title thread writing a view waits on (making
+    // a texture takes up to milliseconds; title threads waited 1-6 s a frame,
+    // runs evict2, noevict1). They are never released, so they outlive it;
+    // the lock is held only to look the slots up and to make the views.
+    let placed: Vec<View> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps
+            .iter()
+            // SAFETY: registered heaps are live (removed when dropped).
+            .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
+            .filter(|heap| heap.desc.kind == VIEWS_KIND)
+            .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
+            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
+            .collect()
+    };
+    #[cfg(test)]
+    tests::while_making(slots);
+    // Several at a time (each a committed texture; hundreds in a new shot,
+    // 7 % of the submitting thread when made one by one, run evict5).
+    crate::texture::in_parallel(placed.len(), |i| {
+        let _ = host::placed_texture(&placed[i]);
+    });
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue;
+        };
+        if heap.desc.kind != VIEWS_KIND {
+            continue;
+        }
+        for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
+            host.mirror(i, start + u64::from(i) * u64::from(step), true);
+            host.stamp_read(i);
+        }
+    }
+}
+
+/// The host textures (raw pointers) that slots `slots` of the
+/// shader-visible view heaps view.
+#[cfg(windows)]
+pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut textures = std::collections::HashSet::new();
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            textures.extend(host.textures_at(slots));
+        }
+    }
+    textures
+}
+
+/// Every shader-visible view heap's slots viewing one of the host textures
+/// `textures` (raw pointers) are left null, made again when read
+/// (`crate::resource::evict` gives those textures up).
+#[cfg(windows)]
+pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            host.evict(textures);
         }
     }
 }
@@ -448,6 +532,18 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
+}
+
+/// For each record (tag, index, generation): whether it names a view that
+/// is current, as [`view_at`] would find it (one lock for them all).
+fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    records
+        .iter()
+        .map(|&[tag, i, generation]| {
+            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+        })
+        .collect()
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -715,7 +811,24 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// Work to run while `make_read` makes the textures of a read slot (the
+    /// slot), outside the heaps' lock.
+    pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
+
+    /// The work [`WHILE_MAKING`] runs.
+    pub(crate) type Work = Box<dyn FnOnce() + Send>;
+
+    pub(crate) fn while_making(slots: &[u32]) {
+        let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());
+        if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot))
+            && let Some((_, work)) = hook.take()
+        {
+            drop(hook);
+            work();
+        }
+    }
+
     use super::*;
     use crate::object::{S_OK, slot};
 

@@ -441,8 +441,16 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
 /// view showing them (DirectStorage's page destinations).
 fn report_written(shown: &[usize]) {
     for &page in shown {
+        #[cfg(test)]
+        REPORTED.with(|r| r.borrow_mut().push(page));
         drop(victory_gpu::kernel_will_write(page, PAGE));
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The title addresses this thread's writes into physical pages reported.
+    static REPORTED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -522,6 +530,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// 16: Grand Theft Auto VI keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
+
+/// How many of `pages` are no allocated page (diagnostics: a DirectStorage
+/// destination that could not be written).
+pub(crate) fn unknown_pages(pages: &[usize]) -> usize {
+    let physical = physical();
+    pages.iter().filter(|p| !physical.pages.contains_key(p)).count()
+}
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -615,7 +630,6 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
-    let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -625,7 +639,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    report_written(&shown);
+    // Where the pages show once written (see `PageWindow`).
+    report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
     true
 }
 
@@ -636,13 +651,18 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
-    /// Title views showing the pages, told when the window is done.
-    shown: Vec<usize>,
+    /// The pages (page numbers) the bytes reach: the title views showing
+    /// them when the window is done are told. Looked up then, not when the
+    /// window opens: a decode takes milliseconds, and the title may map a
+    /// page at another address meanwhile (its GPU heap); a copy that took
+    /// the page there before the bytes landed would never hear of them. An
+    /// address that stops showing a page meanwhile was told by the unmap.
+    pages: Vec<usize>,
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        report_written(&self.shown);
+        report_written(&shown_at(&self.pages));
     }
 }
 
@@ -667,7 +687,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
+        pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
     })
 }
 
@@ -1341,6 +1361,35 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// A page mapped at a second address while a window writes it is
+    /// reported there too when the window is done (the title maps streamed
+    /// pages into its GPU heap while their reads decode); an address that
+    /// stopped showing it meanwhile is not.
+    #[test]
+    fn page_windows_report_where_the_pages_show_when_done() {
+        let pages = allocate(1);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (a, b) = (reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        REPORTED.with(|r| r.borrow_mut().clear());
+        let mut window = page_window(&pages, 0, 16).expect("one run");
+        // Mapped at `b`, unmapped from `a`, while the bytes are written.
+        assert_eq!(XMemMapPhysicalPages(b, 1, pages.as_ptr()), b);
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        window.bytes().fill(3);
+        drop(window);
+        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { b.cast::<u8>().read() }, 3);
+        // `write_physical` the same way.
+        REPORTED.with(|r| r.borrow_mut().clear());
+        assert!(write_physical(&pages, 0, &[4]));
+        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
     #[test]

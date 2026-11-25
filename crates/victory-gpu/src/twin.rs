@@ -8,7 +8,7 @@
 //! contents move between the two by copies where the use changes: within
 //! a list where it records the change (`HostList::transition`), and at
 //! submission for each list's first use, from the side the lists before it
-//! left newer. A 16-bit depth plane in the host's 24-bit one (the
+//! left newer. A 16-bit depth plane in the host's 32-bit float one (the
 //! console's 16-bit depth with stencil) is converted on the way, so a
 //! value written as 16-bit depth compares equal to the same depth
 //! rasterised.
@@ -75,7 +75,7 @@ struct Route {
     /// Its place in the scratch buffer as the twin's texture has it.
     twin: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     /// As the depth texture has it, where that differs: a 16-bit depth
-    /// plane the host keeps in 24 bits (32 per texel), converted.
+    /// plane the host keeps as 32-bit floats, converted.
     depth: Option<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
 }
 
@@ -453,24 +453,16 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     }
 }
 
-/// 16-bit depth (unorm, two per dword) to the host's 24-bit depth plane (in
-/// the low 24 bits of 32) and back, in the scratch buffer: `u * (2^24 - 1)
-/// / 65535` rounded, exactly, and back to the 16-bit value whose 24-bit one
-/// is nearest.
+/// 16-bit depth (unorm, two per dword) to the host's 32-bit float depth
+/// plane and back, in the scratch buffer: `u` becomes `u` times
+/// `0x37800080` (the title's 1/65535; its tiled-lighting draws rasterise
+/// that very float and test it EQUAL), and a float back the nearest `u`.
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
 cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
 RWByteAddressBuffer buf : register(u0);
-uint d24(uint u) { return u * 256 + (u * 255 + 32767) / 65535; }
-uint u16(uint d) {
-    d &= 0xffffff;
-    uint u = min(d >> 8, 65535);
-    uint best = u;
-    int err = abs((int)d24(u) - (int)d);
-    if (u > 0 && abs((int)d24(u - 1) - (int)d) < err) { best = u - 1; err = abs((int)d24(u - 1) - (int)d); }
-    if (u < 65535 && abs((int)d24(u + 1) - (int)d) < err) { best = u + 1; }
-    return best;
-}
+uint depth(uint u) { return asuint((float)u * asfloat(0x37800080)); }
+uint u16(uint d) { return (uint)(saturate(asfloat(d)) * 65535.0 + 0.5); }
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -482,8 +474,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     bool two = x + 1 < width;
     if (toDepth != 0) {
         uint pair = buf.Load(a);
-        buf.Store(b, d24(pair & 0xffff));
-        if (two) buf.Store(b + 4, d24(pair >> 16));
+        buf.Store(b, depth(pair & 0xffff));
+        if (two) buf.Store(b + 4, depth(pair >> 16));
     } else {
         uint lo = u16(buf.Load(b));
         uint hi = two ? u16(buf.Load(b + 4)) : 0;
@@ -572,5 +564,57 @@ mod tests {
         assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
         assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
         assert_eq!(last, Some(TWIN));
+    }
+
+    /// A list that writes a depth texture through its twin and then reads
+    /// its depth side: its prelude owes a copy into the twin first. Every
+    /// barrier the prelude and the list issue starts from the state the
+    /// texture is in, as the debug layer checks (run light21: the prelude's
+    /// copy started from the states the list leaves).
+    #[test]
+    fn prelude_copies_start_from_the_real_states() {
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; our out pointer.
+        unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut texture) }.unwrap();
+        let depth = Arc::new(HostTexture::new(texture.unwrap(), DEPTH_WRITE, Vec::new()));
+        let twin = depth.twin.get_or_init(|| make(53, &depth.texture)).as_ref().unwrap();
+        let list = host.new_list().unwrap();
+        issued();
+        assert!(route(&list, &depth, twin, UNORDERED_ACCESS));
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        assert!(!route(&list, &depth, twin, PIXEL_SHADER_RESOURCE));
+        if let Some(b) = list.move_texture(&depth, PIXEL_SHADER_RESOURCE) {
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[b]) };
+        }
+        list.close();
+        let recorded = issued();
+        host.execute(&[&list]);
+        // The GPU runs the prelude, then the list.
+        let mut run = issued();
+        run.extend(recorded);
+        let key = |t: &HostTexture| t.texture.as_raw() as usize;
+        let mut states = std::collections::HashMap::from([(key(&depth), DEPTH_WRITE), (key(&twin.planes[0]), 0)]);
+        replay(&run, &mut states).unwrap();
+        // What the list left is what the next prelude starts from.
+        assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
+        assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));
     }
 }

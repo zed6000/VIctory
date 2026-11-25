@@ -144,7 +144,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: name });
     put(out, file)
 }
 
@@ -258,6 +258,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// As the title named it (diagnostics).
+    path: String,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -368,6 +370,9 @@ struct Lane {
     clock: u64,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
+    /// Left out when the queue submitted itself, until the title's Submit:
+    /// reads into physical pages and the status entries behind them.
+    held: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Request)>,
@@ -547,8 +552,20 @@ impl Lanes {
         }
     }
 
-    /// Moves a queue's enqueued commands to the workers.
+    /// Moves a queue's enqueued commands to the workers (the title's
+    /// Submit).
     fn submit(&mut self, id: u64) {
+        self.submit_as(id, true);
+    }
+
+    /// As [`Lanes::submit`]; `explicit` false when a half-full queue submits
+    /// itself, which leaves reads into physical pages for the title's
+    /// Submit: their page lists point into the title's page table, which
+    /// Grand Theft Auto VI fills for the batch in its own submit path, right
+    /// before Submit (`sub_1400e88f0`), so until then they name no page or a
+    /// page that now holds something else. A status entry behind a held
+    /// read waits with it.
+    fn submit_as(&mut self, id: u64, explicit: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -567,7 +584,18 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        for command in std::mem::take(&mut lane.unsubmitted) {
+        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
+        commands.append(&mut lane.unsubmitted);
+        for command in commands {
+            let hold = !explicit
+                && match &command {
+                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                    Command::Status(_) => !lane.held.is_empty(),
+                };
+            if hold {
+                lane.held.push(command);
+                continue;
+            }
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
@@ -586,6 +614,7 @@ impl Lane {
             capacity: usize::from(capacity),
             clock: 0,
             unsubmitted: Vec::new(),
+            held: Vec::new(),
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
@@ -596,7 +625,11 @@ impl Lane {
 
     /// Requests and status entries held, submitted or not.
     fn entries(&self) -> usize {
-        self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
+        self.unsubmitted.len()
+            + self.held.len()
+            + self.reads.len()
+            + self.statuses.len()
+            + self.running.len()
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -644,6 +677,7 @@ fn close_lane(id: u64) {
     };
     lane.closed = true;
     lane.unsubmitted.clear();
+    lane.held.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
@@ -755,6 +789,16 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        // Full with reads held for a Submit the title cannot make while it
+        // waits here: they go now, page lists as they are.
+        if !lane.held.is_empty() {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("dstorage: a full queue's reads into physical pages start before the title's Submit");
+            }
+            lanes.submit(id);
+            scheduler.work.notify_all();
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -765,8 +809,19 @@ fn queue(this: QueueRef, command: Command) {
     };
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
+        let capacity = lane.capacity;
+        lanes.submit_as(id, false);
         scheduler.work.notify_all();
+        let held = lanes.lanes.get(&id).map_or(0, |l| l.held.len());
+        let n = AUTO_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(
+                n,
+                capacity,
+                held,
+                "dstorage: a queue half full submitted itself; reads into physical pages wait for the title's Submit"
+            );
+        }
     }
 }
 
@@ -777,7 +832,7 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
+    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
     scheduler.work.notify_all();
@@ -1012,10 +1067,27 @@ fn into_destination(
         offset,
         len,
         pages = pages.len(),
+        unknown = super::xmem::unknown_pages(pages),
+        list = format_args!("{:x?}", &pages[..pages.len().min(8)]),
+        options = format_args!("{:#x}", request.options),
+        file = source_name(request),
+        file_offset = request.offset,
         "dstorage: a destination's physical pages could not be written; its request fails"
     );
     Err(E_INVALIDARG)
 }
+
+/// The file a request reads, as the title named it, or "memory".
+fn source_name(request: &Request) -> &str {
+    if request.options & MEMORY_SOURCE != 0 {
+        return "memory";
+    }
+    // SAFETY: a file object we created; the title keeps it open.
+    &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
+}
+
+/// Queues that submitted themselves, half full (diagnostics).
+static AUTO_SUBMITS: AtomicU32 = AtomicU32::new(0);
 
 /// Milliseconds a page list naming page 0 is read again for.
 const LATE_LIST_TRIES: u32 = 8;
@@ -1573,6 +1645,95 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
     }
+    #[test]
+    fn a_queue_that_submits_itself_holds_reads_into_pages() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        read(&mut l, 0, PAGE_DESTINATION, 16);
+        read(&mut l, 0, 0, 16);
+        add_ref_instance(array);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
+        l.submit_as(0, false);
+        // Only the plain read starts; the status waits behind the held one.
+        let plain = l.start().unwrap();
+        assert_eq!(plain.request.options, 0);
+        assert!(l.start().is_none());
+        l.finish(&plain, Ok(()));
+        assert_eq!(l.lanes[&0].held.len(), 2);
+        l.submit(0);
+        let paged = l.start().unwrap();
+        assert_eq!(paged.request.options, PAGE_DESTINATION);
+        assert!(l.lanes[&0].held.is_empty());
+        assert!(!l.lanes[&0].statuses.is_empty());
+        l.finish(&paged, Ok(()));
+        assert!(l.lanes[&0].statuses.is_empty());
+    }
+
+    #[test]
+    fn a_page_list_the_title_changes_before_its_submit() {
+        use crate::modules::xmem;
+        let (mut given, mut pages) = (2usize, [0usize; 2]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
+        // The title's page table: still the page's previous owner when the
+        // request is enqueued, the right page by its Submit.
+        let mut list = [pages[0]];
+        let plain = pattern(4096);
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 4,
+            priority: 1,
+            name: c"pages".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let array = status_array(1);
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &r);
+        let mut out = [0u8; 16];
+        enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
+        // Half of four: the queue submitted itself. Time for a read started
+        // then to land in the old page.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // SAFETY: the list outlives the request, which reads it when it runs.
+        unsafe { std::ptr::write_volatile(list.as_mut_ptr(), pages[1]) };
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, plain[..16]);
+        // SAFETY: both pages are mapped read-write.
+        let (first, second) = unsafe {
+            (
+                std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()),
+                std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE), plain.len()),
+            )
+        };
+        assert_eq!(second, plain);
+        assert!(first.iter().all(|&b| b == 0), "the old page was written");
+    }
+
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;

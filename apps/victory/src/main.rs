@@ -136,6 +136,11 @@ enum Console {
     SeriesS,
 }
 
+/// Diagnostics: the heap bytes Rust code holds, for the statistics.
+#[cfg(all(windows, feature = "diagnostics"))]
+#[global_allocator]
+static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
+
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
