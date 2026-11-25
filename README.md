@@ -52,6 +52,12 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
+the installer from https://rustup.rs). The first `cargo` command in this
+repository then fetches the pinned toolchain. Building needs the MSVC C++
+build tools: Visual Studio or its Build Tools with the "Desktop development
+with C++" workload.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -95,6 +101,13 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
+Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
+top-level window to that bounding box. Smaller windows keep their size,
+larger windows keep their proportions, and the monitor's work area still
+limits them. This scales the displayed image; it does not change the
+console render resolution or the swap-chain buffers. With the variable
+unset, window sizing is unchanged.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
@@ -124,6 +137,24 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+### Windows shader-test validator
+
+The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
+An older Windows SDK validator can load successfully but reject them with
+`Unknown shader model 'ps_6_6'`. If this happens, use a current x64 validator
+from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
+or a current Windows SDK. Set its path for the test session:
+
+```powershell
+$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
+cargo test -p victory-shader --lib --locked -- --test-threads=1
+```
+
+Without this override, the validator loader selects the newest installed
+Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
+path when no SDK copy is found. This is a test/offline-validation dependency;
+the translated shaders do not require it at runtime.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
@@ -132,6 +163,8 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
+The on/off switches below (`...=1`) are off when unset or set to `0`.
+
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
@@ -139,6 +172,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
@@ -158,8 +192,25 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+Every build appends unhandled exceptions, panics, and host GPU failures to
+`crashes.log` in the title's data folder.
+
+For a startup breakpoint (`0x80000003`), run the diagnostics build with
+`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
+`crashes.log` entries. A host DLL refusal includes the caller stack in the
+console output. The refusal is expected for DLLs outside the host policy,
+including `rpcrt4.dll`.
+
+On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
+`+0x2237178` before the first window. Restore the archive from the same
+package beside the title executable. `run --execute` checks that it can
+read the RPF9 header before starting this build.
+
+To compare hardware and software rendering, repeat with
+`VICTORY_D3D12_WARP=1` and check the console for
+`host device on the software adapter (WARP)` to confirm the WARP device was
+created. Compare the exception's module and offset, stack frames, and
+preceding messages across the two runs.
 
 ## License
 

@@ -96,7 +96,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     );
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
@@ -254,7 +254,7 @@ pub(crate) fn binding(pipeline: &str) {
 
 pub(crate) fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
 /// `VICTORY_DUMP_WRITERS`' hashes not dumped yet.

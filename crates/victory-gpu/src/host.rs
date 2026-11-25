@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -57,7 +58,7 @@ pub(crate) struct Host {
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
-    presenter: Mutex<Option<Presenter>>,
+    presenter: Mutex<Presentation>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -140,8 +141,7 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
@@ -152,7 +152,7 @@ fn create() -> windows::core::Result<Host> {
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
             // (directly indexed textures are not transitioned).
-            if std::env::var_os("VICTORY_D3D12_GBV").is_some()
+            if crate::switch::on("VICTORY_D3D12_GBV")
                 && let Some(l) = &layer
             {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
@@ -181,12 +181,14 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Whether a GPU hang ends the run or freezes the PC (#1054).
+            crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -251,7 +253,7 @@ fn create() -> windows::core::Result<Host> {
             next_cpu_view: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
-            presenter: Mutex::new(None),
+            presenter: Mutex::new(Presentation::default()),
         })
     }
 }
@@ -280,7 +282,52 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
+        use super::{Duration, Instant, SwapChainRetry};
+
+        let start = Instant::now();
+        let mut retry = SwapChainRetry::default();
+        let mut attempts = 0;
+        // Two seconds at 60 Hz, with a failure on every eligible attempt.
+        for frame in 0..120 {
+            retry.attempt(start + Duration::from_millis(frame * 1000 / 60), || {
+                attempts += 1;
+                Err::<(), _>("desktop unavailable")
+            });
+        }
+        assert_eq!(attempts, 2);
+        let recovered = start + Duration::from_secs(2);
+        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(42)), Some(Ok(42)));
+        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(43)), Some(Ok(43)));
+    }
+
     use super::*;
+
+    #[test]
+    fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let first = list.scratch(1).unwrap();
+        let second = list.scratch(1).unwrap();
+        assert_eq!(second.0 - first.0, 256);
+        assert_eq!(second.1 as usize - first.1 as usize, 256);
+        assert_eq!(list.scratch.lock().unwrap().chunks[0].capacity, FIRST_SCRATCH_CHUNK);
+        let large = list.scratch(96 << 10).unwrap();
+        assert_eq!(list.scratch.lock().unwrap().chunks[1].capacity, 128 << 10);
+        assert!(list.scratch(u64::MAX).is_none());
+        assert!(list.scratch(SCRATCH_CHUNK + 1).is_some());
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(list.scratch(96 << 10).unwrap(), large);
+        assert_eq!(list.scratch.lock().unwrap().chunks.len(), 2);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert_eq!(list.scratch(512).unwrap(), first);
+        list.close();
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -305,6 +352,110 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    /// A node of the device-removed data is a list by pointer or by name.
+    /// The name is what still matches when the runtime records another
+    /// object than the one we hold (the debug layer wraps ours), and a
+    /// different list or an unnamed node never matches.
+    #[test]
+    fn a_breadcrumb_node_is_found_by_pointer_or_by_name() {
+        let ours = [0x1000, 0x1008];
+        let name = list_name(7);
+        let is = |pointer, text| node_is_list(pointer, text, &ours, &name);
+        assert_eq!(name, "victory host list 7");
+        assert!(is(Some(0x1000), None));
+        assert!(is(Some(0x1008), Some("other")));
+        assert!(is(Some(0x9999), Some("victory host list 7")));
+        assert!(is(None, Some("victory host list 7")));
+        assert!(!is(Some(0x9999), Some("victory host list 70")));
+        assert!(!is(Some(0x9999), None));
+        assert!(!is(None, None));
+        // The debug layer appends its own note to the name we gave.
+        assert!(is(None, Some("victory host list 7 (debug layer indirect)")));
+        assert!(is(None, Some("victory host list 7 (x)")));
+        assert!(!is(
+            None,
+            Some("victory host list 70 (debug layer indirect)")
+        ));
+        assert!(!is(None, Some("victory host list 7 debug layer")));
+        assert!(!is(None, Some("victory host list 7(")));
+        assert!(is(None, Some("victory host list 7")));
+        assert_eq!(list_name(70), "victory host list 70");
+    }
+
+    /// The pointers of one list: the interface pointers it answers with
+    /// are all there, and another list's are not.
+    #[test]
+    fn a_list_knows_every_pointer_it_answers_with() {
+        // SAFETY: plain device and list creation on the software adapter.
+        unsafe {
+            let Ok(adapter) = warp_adapter() else { return };
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                return;
+            }
+            let device = device.unwrap();
+            // An open list holds its allocator: one each.
+            let make = || -> ID3D12GraphicsCommandList {
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .unwrap()
+            };
+            let (a, b) = (make(), make());
+            let pointers = identities(&a);
+            assert!(pointers.contains(&(a.as_raw() as usize)));
+            let unknown = a.cast::<windows::core::IUnknown>().unwrap();
+            assert!(pointers.contains(&(unknown.as_raw() as usize)));
+            let command_list = a.cast::<ID3D12CommandList>().unwrap();
+            assert!(pointers.contains(&(command_list.as_raw() as usize)));
+            let other = identities(&b);
+            assert!(pointers.iter().all(|p| !other.contains(p)));
+            // As a node: the same object by any of its pointers; a node
+            // naming the other list by pointer and our name still matches.
+            let name = list_name(3);
+            let is = |pointer, text| node_is_list(pointer, text, &pointers, &name);
+            assert!(is(Some(command_list.as_raw() as usize), None));
+            assert!(!is(Some(b.as_raw() as usize), None));
+            assert!(is(Some(b.as_raw() as usize), Some(&name)));
+        }
+    }
+
+    /// A node as the runtime gives it, built by hand: `HostList::is_node`
+    /// reads the pointer and the copied name, and the name alone finds a
+    /// list the runtime records under another object.
+    #[test]
+    fn is_node_reads_the_name_the_runtime_copied() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let mut wide: Vec<u16> = list_name(list.id).encode_utf16().collect();
+        wide.push(0);
+        let mut node = D3D12_AUTO_BREADCRUMB_NODE::default();
+        assert!(!list.is_node(&node), "an empty node is no list");
+        node.pCommandListDebugNameW = windows::core::PCWSTR(wide.as_ptr());
+        assert!(list.is_node(&node), "found by its name alone");
+        let mut other: Vec<u16> = list_name(list.id + 1).encode_utf16().collect();
+        other.push(0);
+        node.pCommandListDebugNameW = windows::core::PCWSTR(other.as_ptr());
+        assert!(!list.is_node(&node), "another list's name is no match");
+        // With the debug layer: our name and the layer's note, in either
+        // name field; and a list whose number only starts with ours is not it.
+        let note = std::ffi::CString::new(format!("{} (debug layer indirect)", list_name(list.id)))
+            .unwrap();
+        node.pCommandListDebugNameW = windows::core::PCWSTR::null();
+        node.pCommandListDebugNameA = note.as_ptr().cast();
+        assert!(
+            list.is_node(&node),
+            "found by its ANSI name with the layer's note"
+        );
+        let longer =
+            std::ffi::CString::new(format!("{}0 (debug layer indirect)", list_name(list.id)))
+                .unwrap();
+        node.pCommandListDebugNameA = longer.as_ptr().cast();
+        assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
 }
 
@@ -335,6 +486,9 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// Which list this is, for the name that tells it apart in device-removed
+    /// data (see [`HostList::is_node`]).
+    id: u64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -369,9 +523,7 @@ type States = std::collections::HashMap<
 /// builds).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow
@@ -380,7 +532,7 @@ pub(crate) fn dred_on() -> bool {
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -394,11 +546,63 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     }
 }
 
+/// The id of the next host list (see [`HostList::is_node`]).
+static NEXT_LIST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The name a host list gets with device-removed data on.
+fn list_name(id: u64) -> String {
+    format!("victory host list {id}")
+}
+
+/// The pointers one of our list objects answers to: its own and the one each
+/// interface a runtime may record it by gives (COM identity is the
+/// `IUnknown` one). Only our live object is queried: a node of the
+/// device-removed data may name a list that is long released, so its pointer
+/// is compared and never dereferenced.
+fn identities(list: &impl Interface) -> Vec<usize> {
+    let mut found = vec![list.as_raw() as usize];
+    let mut add = |pointer: Option<*mut core::ffi::c_void>| {
+        if let Some(pointer) = pointer {
+            found.push(pointer as usize);
+        }
+    };
+    add(list
+        .cast::<windows::core::IUnknown>()
+        .ok()
+        .map(|i| i.as_raw()));
+    add(list.cast::<ID3D12Object>().ok().map(|i| i.as_raw()));
+    add(list.cast::<ID3D12DeviceChild>().ok().map(|i| i.as_raw()));
+    add(list.cast::<ID3D12CommandList>().ok().map(|i| i.as_raw()));
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Whether a node of the device-removed data is a list: by pointer, or by the
+/// name the runtime copied when the list was submitted. With the debug layer
+/// on, the object we hold is its wrapper and the runtime records another
+/// one, so no pointer of ours matches, and it appends its own note to our
+/// name ("victory host list 158 (debug layer indirect)"). The name matches
+/// exactly or followed by " (": never as the start of another number.
+fn node_is_list(
+    node_pointer: Option<usize>,
+    node_name: Option<&str>,
+    pointers: &[usize],
+    name: &str,
+) -> bool {
+    node_pointer.is_some_and(|p| pointers.contains(&p))
+        || node_name.is_some_and(|n| {
+            n == name
+                || n.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with(" ("))
+        })
+}
+
 /// Upload chunks handed out front to back: the chunks, the one in use and
 /// the bytes used in it.
 #[derive(Default)]
 struct Scratch {
-    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    chunks: Vec<ScratchChunk>,
     current: usize,
     used: u64,
 }
@@ -407,6 +611,14 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
+
+struct ScratchChunk {
+    _buffer: ID3D12Resource,
+    mapped: usize,
+    gpu: u64,
+    capacity: u64,
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -423,8 +635,9 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// whether they mark the pages they write (no snapshot then).
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -560,6 +773,8 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
+            name(&list, || list_name(id));
             Ok(HostList {
                 allocator,
                 list,
@@ -570,6 +785,7 @@ impl Host {
                 rebind: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                id,
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -750,7 +966,7 @@ impl Host {
             // the title's own data (runs c1, c4).
             let missed = deferred.missed.iter().any(|check| check());
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
+                if let Step::GpuWrite(shadow, address, len, _) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     match index.get(&key) {
                         Some(&i) => back[i].3 &= !missed,
@@ -762,6 +978,14 @@ impl Host {
                 }
             }
         }
+        // Pages shaders marked first: the copy-backs below end what the
+        // copies keep for them.
+        let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
+            .iter()
+            .filter(|b| !b.3)
+            .map(|(s, a, n, _)| (s.clone(), *a, *n))
+            .collect();
+        crate::shadow::copy_back_marks(&withheld);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -863,19 +1087,47 @@ impl Host {
                     return text;
                 }
             };
-            // Every list's progress (done/count), in the runtime's order.
-            let mut progress = Vec::new();
+            // The nodes, oldest list first, and which run each is.
+            let mut nodes = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
-                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                nodes.push(p);
                 node = p.pNext;
             }
+            let index: Vec<Option<usize>> = nodes
+                .iter()
+                .map(|p| runs.iter().position(|r| r.is_node(p)))
+                .collect();
+            if let Some(last) = nodes.last()
+                && index.iter().all(Option::is_none)
+            {
+                let name = |w: windows::core::PCWSTR, a: *const u8| {
+                    let w = (!w.is_null()).then(|| w.to_string().unwrap_or_default());
+                    let a = (!a.is_null()).then(|| {
+                        std::ffi::CStr::from_ptr(a.cast())
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    format!("{w:?}/{a:?}")
+                };
+                tracing::warn!(
+                    nodes = nodes.len(),
+                    last_pointer = ?last.pCommandList.as_ref().map(|l| l.as_raw()),
+                    last_names = %name(last.pCommandListDebugNameW, last.pCommandListDebugNameA),
+                    "no breadcrumb node named one of our lists"
+                );
+            }
+            // Every list's progress (done/count), in the runtime's order.
+            let progress: Vec<String> = nodes
+                .iter()
+                .zip(&index)
+                .map(|(p, index)| {
+                    let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                    format!("{done}/{} {index:?}", p.BreadcrumbCount)
+                })
+                .collect();
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
-            let mut plain = crumbs.pHeadAutoBreadcrumbNode;
-            while let Some(p) = plain.as_ref() {
+            for (p, index) in nodes.iter().zip(&index) {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
@@ -884,8 +1136,7 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = index.map(|i| runs[i]);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
@@ -912,7 +1163,6 @@ impl Host {
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
                 }
-                plain = p.pNext;
             }
         }
         text
@@ -1070,6 +1320,28 @@ impl HostList {
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    /// Whether `node` of the device-removed data (its breadcrumbs) is this
+    /// list.
+    fn is_node(&self, node: &D3D12_AUTO_BREADCRUMB_NODE) -> bool {
+        // SAFETY: only the pointer and the name text are read: the pointer is
+        // compared, never used, and the name is the runtime's copy.
+        let (pointer, wide, ansi) = unsafe {
+            (
+                node.pCommandList.as_ref().map(|l| l.as_raw() as usize),
+                (!node.pCommandListDebugNameW.is_null())
+                    .then(|| node.pCommandListDebugNameW.to_string().unwrap_or_default()),
+                (!node.pCommandListDebugNameA.is_null()).then(|| {
+                    std::ffi::CStr::from_ptr(node.pCommandListDebugNameA.cast())
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+            )
+        };
+        let (pointers, name) = (identities(&self.list), list_name(self.id));
+        node_is_list(pointer, wide.as_deref(), &pointers, &name)
+            || node_is_list(None, ansi.as_deref(), &pointers, &name)
     }
 
     pub(crate) fn close(&self) {
@@ -1364,16 +1636,18 @@ impl HostList {
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
-    /// host copy: copied back into title memory once the list has run.
+    /// host copy: copied back into title memory once the list has run
+    /// (`marked`: the pages they mark).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        marked: bool,
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
     }
 
     /// Shaders of the list take views from the heap itself
@@ -1426,7 +1700,7 @@ impl HostList {
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
+        let len = len.max(1).checked_next_multiple_of(256)?;
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
@@ -1435,21 +1709,30 @@ impl HostList {
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        while let Some(chunk) = s.chunks.get(s.current) {
+            if len <= chunk.capacity - s.used {
+                break;
+            }
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            name(&buffer, || "list scratch".into());
+            let next = s.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
+            let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
+            let (buffer, data) = host.upload_buffer(capacity)?;
+            name(&buffer, || format!("list scratch {capacity:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
+            #[cfg(feature = "diagnostics")]
+            tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
+                chunk = s.current, requested = len, capacity, "allocated list scratch");
+            s.chunks.push(ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity });
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
+        let chunk = &s.chunks[s.current];
         let at = s.used;
+        let result = (chunk.gpu + at, (chunk.mapped + at as usize) as *mut u8);
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some(result)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -1568,10 +1851,13 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                Step::GpuWrite(shadow, address, len, marked) => {
+                    // The shaders start from the title's data, which a
+                    // snapshot must hold (marked ranges keep none).
+                    if !marked {
+                        batch.flush();
+                    }
+                    shadow.writing(*address, *len, *marked);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1685,12 +1971,16 @@ impl Batch {
 /// Copies title memory at submission. The ranges were checked against their
 /// resources when recorded, but the title may since have unmapped pages of
 /// them (tiled memory, page mappings), which read as zeros here; a title
-/// destination (`title_dst`) that is not all mapped is left alone.
+/// destination (`title_dst`) that is not all mapped takes nothing from its
+/// first unmapped page on.
 ///
-/// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
-/// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// The copy runs in the kernel (`ReadProcessMemory`), which reports an
+/// unmapped page of the source, or of the destination it writes, instead of
+/// faulting. Asking `VirtualQuery` first cost about 2 ms per copy in the
+/// title's big pools (it walks the page tables to the region's end), which
+/// made copies run at 100-200 MB/s; a title destination is asked only once
+/// its copy has failed (asked before each, the world's 80 copies per frame
+/// cost 60 ms).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -1702,7 +1992,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 {
         return;
     }
     // The kernel writes the destination: it must not be guarded meanwhile.
@@ -1713,6 +2003,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
+        return;
+    }
+    // The copy stopped at an unmapped page. One of a title destination ends
+    // it: the retries below write the destination themselves (zeros for
+    // what cannot be read), and would fault there.
+    if title_dst && !crate::texture::committed(dst, len) {
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -1741,29 +2037,29 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
-/// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
+/// page is not readable or a destination page not writable (the bytes
+/// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
+    // SAFETY: the destination is `len` bytes the caller may write, host
+    // memory or title memory; the kernel checks both ranges, and a page it
+    // cannot read or write fails the call instead of faulting.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
+///
+/// Through [`read`]: the kernel refuses an unmapped destination page as it
+/// does a source page. `WriteProcessMemory` makes the same copy, but asks
+/// for the destination's region first, at `VirtualQuery`'s cost (see
+/// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
+/// per frame.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
-        let mut done = 0;
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
-    };
+    let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
     if len == 0 || write(dst as usize, len) {
         return;
     }
@@ -1785,6 +2081,101 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
         let next = ((at / step + 1) * step).min(end);
         f(at, next - at);
         at = next;
+    }
+}
+
+#[cfg(test)]
+mod title_copies {
+    use super::{copy_mapped, write_mapped};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualProtect,
+    };
+
+    const BLOCK: usize = 64 << 10;
+
+    /// Three reserved blocks, the first and the last committed and filled
+    /// with `fill`: title memory with an unmapped block in it.
+    fn holed(fill: u8) -> *mut u8 {
+        // SAFETY: a fresh reservation; the committed blocks are ours to fill.
+        unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 3 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            for block in [0, 2] {
+                let at = base.add(block * BLOCK);
+                assert!(!VirtualAlloc(at.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+                at.write_bytes(fill, BLOCK);
+            }
+            base
+        }
+    }
+
+    fn block<'a>(base: *const u8, n: usize) -> &'a [u8] {
+        // SAFETY: tests ask for committed blocks only.
+        unsafe { std::slice::from_raw_parts(base.add(n * BLOCK), BLOCK) }
+    }
+
+    fn release(base: *mut u8) {
+        // SAFETY: a reservation of `holed`.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+    }
+
+    fn pattern() -> Vec<u8> {
+        (0..3 * BLOCK).map(|i| (i % 251) as u8 + 1).collect()
+    }
+
+    #[test]
+    fn title_copies_reach_mapped_destinations_and_stop_at_unmapped_pages() {
+        let from = pattern();
+        // All mapped: copied, through a destination that was never asked.
+        let to = holed(0xee);
+        copy_mapped(to, from.as_ptr(), BLOCK, true);
+        assert_eq!(block(to, 0), &from[..BLOCK]);
+        release(to);
+        // An unmapped block in the destination: nothing faults, and nothing
+        // arrives from that block on.
+        let to = holed(0xee);
+        copy_mapped(to, from.as_ptr(), 3 * BLOCK, true);
+        assert!(block(to, 2).iter().all(|&b| b == 0xee));
+        release(to);
+        // An unmapped block in the source reads as zeros.
+        let holes = holed(7);
+        let mut to = vec![0xeeu8; 3 * BLOCK];
+        copy_mapped(to.as_mut_ptr(), holes, 3 * BLOCK, true);
+        assert!(to[..BLOCK].iter().all(|&b| b == 7));
+        assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
+        assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
+        release(holes);
+    }
+
+    #[test]
+    fn copy_back_writes_mapped_pages_only() {
+        let from = pattern();
+        let to = holed(0xee);
+        write_mapped(to, from.as_ptr(), 3 * BLOCK);
+        assert_eq!(block(to, 0), &from[..BLOCK]);
+        assert_eq!(block(to, 2), &from[2 * BLOCK..]);
+        release(to);
+        // Neither aligned nor whole: the bytes around the range stay.
+        let to = holed(0xee);
+        // SAFETY: inside the first block.
+        write_mapped(unsafe { to.add(100) }, from.as_ptr(), BLOCK - 300);
+        let first = block(to, 0);
+        assert_eq!(first[100..BLOCK - 200], from[..BLOCK - 300]);
+        let around = first[..100].iter().chain(&first[BLOCK - 200..]);
+        assert!(around.into_iter().all(|&b| b == 0xee));
+        // A page that is mapped but not writable is not written either
+        // (guarded title blocks are opened before they are copied back).
+        let mut old = 0;
+        // SAFETY: a committed block of ours.
+        let protected =
+            unsafe { VirtualProtect(to.add(2 * BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0);
+        // SAFETY: the third block.
+        write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
+        assert!(block(to, 2).iter().all(|&b| b == 0xee));
+        release(to);
     }
 }
 
@@ -1880,6 +2271,34 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 }
 
 const BUFFERS: u32 = 2;
+
+#[derive(Default)]
+struct Presentation {
+    presenter: Option<Presenter>,
+    retry: SwapChainRetry,
+}
+
+#[derive(Default)]
+struct SwapChainRetry {
+    next_attempt: Option<Instant>,
+}
+
+impl SwapChainRetry {
+    /// A desktop can become presentable again. Keep retrying while limiting
+    /// the DXGI calls and warnings during the outage.
+    fn attempt<T, E>(
+        &mut self,
+        now: Instant,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Option<Result<T, E>> {
+        if self.next_attempt.is_some_and(|next| now < next) {
+            return None;
+        }
+        let result = operation();
+        self.next_attempt = result.is_err().then(|| now + Duration::from_secs(1));
+        Some(result)
+    }
+}
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -2040,27 +2459,37 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
-        let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match retry
+                .attempt(Instant::now(), || self.presenter(width, height, format))?
+            {
                 Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
+                Err((step, e)) => {
+                    tracing::warn!(error = %e, step, width, height, format = format.0, "no swap chain");
                     return None;
                 }
             };
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
-            // SAFETY: no back buffer is held; every submission was waited for.
-            let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
-            };
+            let resized = retry.attempt(Instant::now(), || {
+                // SAFETY: no back buffer is held; every submission was waited for.
+                unsafe {
+                    p.swap_chain.ResizeBuffers(
+                        BUFFERS,
+                        width,
+                        height,
+                        format,
+                        DXGI_SWAP_CHAIN_FLAG(0),
+                    )
+                }
+            })?;
             match resized {
                 Ok(()) => (p.width, p.height, p.format) = (width, height, format),
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    tracing::warn!(error = %e, width, height, format = format.0, "swap chain not resized");
                     return None;
                 }
             }
@@ -2119,14 +2548,15 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-    ) -> windows::core::Result<Presenter> {
+    ) -> Result<Presenter, (&'static str, windows::core::Error)> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
-            None => window(width, height)?,
+            None => window(width, height).map_err(|e| ("window", e))?,
         };
         // SAFETY: plain object creation for our window.
         unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+                .map_err(|e| ("DXGI factory", e))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -2141,9 +2571,10 @@ impl Host {
                 ..Default::default()
             };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
-            let copy = self.new_list()?;
+                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                .and_then(|chain| chain.cast::<IDXGISwapChain3>())
+                .map_err(|e| ("swap chain", e))?;
+            let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
