@@ -1997,12 +1997,13 @@ mod barycentric_tests {
                 eprintln!("no barycentrics on {backend}; skipped");
                 continue;
             }
-            for case in 0..9 {
+            for case in 0..13 {
                 let ps = match case {
                     0 | 1 => first_half_pixel(case == 1),
                     2 => first_half_high_word_pixel(),
                     3 | 4 => in_place_weights_pixel(case - 3),
-                    _ => modified_f16_pixel(case == 6 || case == 8, case <= 6),
+                    5..=8 => modified_f16_pixel(case == 6 || case == 8, case <= 6),
+                    _ => p0_and_pair_pixel(case >= 11, ((case - 9) & 1) as u8).unwrap(),
                 };
                 validate(&ps);
                 let (root, pso) = host.pipeline(&vs, &ps).expect("interpolation pipeline");
@@ -2029,10 +2030,14 @@ mod barycentric_tests {
                         1 => partial + 2.0 + i * 4.0 + j * 8.0,
                         3 => 2.0 + i * 2.0 + j * 8.0,
                         4 => 2.0 + i * 4.0 + j * 4.0,
+                        9..=12 => {
+                            2.0 + i * 4.0 + j * 8.0
+                                + if (case - 9).is_multiple_of(2) { 2.0 } else { 0.0 }
+                        }
                         _ => partial,
                     };
                     for &got in texel {
-                        if case == 2 || case >= 5 {
+                        if case == 2 || (5..=8).contains(&case) {
                             let old = if case == 2 || case >= 7 { partial } else { 2.0 + i * 2.0 };
                             let full = old + j * 8.0;
                             let f = match case {
@@ -2222,5 +2227,49 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    fn p0_and_pair_pixel(first: bool, channel: u8) -> Result<HostShader, ShaderError> {
+        let [e0, e1] = exp_mrt0(2);
+        let p0 = 0xC812_0002 | u32::from(channel) << 8; // v_interp_mov_f32 v4, p0, attr0
+        let mut words = Vec::new();
+        if first {
+            words.push(p0);
+        }
+        words.extend([
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+        ]);
+        if !first {
+            words.push(p0);
+        }
+        words.extend([v_add_f32(2, 2, 4), e0, e1, S_ENDPGM]);
+        pixel(&words, PERSP_CENTER)
+    }
+
+    #[test]
+    fn p0_and_an_interpolation_can_share_a_row() {
+        for first in [false, true] {
+            for channel in [0, 1] {
+                let shader = p0_and_pair_pixel(first, channel)
+                    .unwrap_or_else(|e| panic!("P0 first={first}, channel={channel}: {e}"));
+                let (features, inputs) = parts(&shader);
+                assert_ne!(features & 0x2_0000, 0);
+                assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+                assert_eq!(texcoord_mode(&shader), 1);
+                validate(&shader);
+            }
+        }
+    }
+
+    #[test]
+    fn p0_alone_stays_flat_without_barycentrics() {
+        let [e0, e1] = exp_mrt0(4);
+        let shader = pixel(&[0xC812_0002, e0, e1, S_ENDPGM], PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0);
+        assert!(inputs.iter().all(|e| e.kind != 28));
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
     }
 }

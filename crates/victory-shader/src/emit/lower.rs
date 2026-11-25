@@ -7721,14 +7721,14 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Whether the program reads attribute row `row` per vertex (an
-    /// interpolation with computed barycentrics, or P10 or P20): then its
-    /// element is declared constant and read with `attributeAtVertex`.
+    /// Whether interpolation of row `row` must read vertices: computed
+    /// weights, or a vertex value read alongside an interpolation. Its
+    /// input stays constant so every read agrees on the row's mode.
     fn per_vertex(&self, row: u8) -> bool {
         self.interps.values().any(|i| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
-            Interp::Vertex { attribute, vertex } => {
-                attribute.row == row && vertex != 2 && self.interpolated(row)
+            Interp::Vertex { attribute, .. } => {
+                attribute.row == row && self.interpolated(row)
             }
             Interp::Interpolated { .. } => false,
         })
