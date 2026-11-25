@@ -24,21 +24,37 @@
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
-//!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
+//!   a heap sampler it uses must be a comparison sampler on the host. One
+//!   of two immediate samplers chosen by uniform control flow takes two
+//!   entries; the sampling runs with both and the result is chosen.
+//! * **Root CBVs** as root descriptors `b<i>` in [`ROOT_CBV_SPACE`], `i`
+//!   the title's root parameter index ([`HostShader::root_cbvs`]); the
 //!   address the title sets is the buffer's.
+//! * **Root SRVs and root UAVs** (raw buffers; changed 2026-11-24) are
+//!   resource-heap views the host makes: a raw SRV (UAV) of the whole host
+//!   copy holding the root address, at the heap index the host writes into
+//!   the [`HostShader::user_data`] entry marked [`ROOT_SRV_VIEW`]
+//!   ([`ROOT_UAV_VIEW`]) (dword `index` = the root descriptor's own first
+//!   user-data dword, which such a program never reads as data), and the
+//!   root address's byte offset in that copy into the entry marked
+//!   [`ROOT_VIEW_OFFSET`] (its second); the shader adds that offset to
+//!   every offset it reads at. Host root descriptors have no bounds, so a
+//!   shader reading past the copy read other memory or faulted; through
+//!   the view it reads 0 and its writes there are dropped. One view per
+//!   host copy (and kind) serves every draw of a list. In programs that
+//!   use title memory (below) root SRVs and UAVs are title memory instead;
+//!   elsewhere [`HostShader::root_srvs`] and [`HostShader::root_uavs`] now
+//!   hold only the host's own tables (`VIEW_STRIDES`).
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
 //!   2_10_10_10 unorm, 8_8_8_8 and 16_16_16_16 uint...) is in the
 //!   instruction, so the translation reads raw bytes and converts them
 //!   itself. Their descriptors are built around a root SRV (stride 1, no
-//!   record limit): the host binds the root SRV `t<slot>` above with the
-//!   address the title sets, nothing more. The vertex index, the stride
-//!   and the attribute offset are the shader's own arithmetic on data in
-//!   that buffer (per-stream headers), not descriptor fields.
+//!   record limit): the shader reads it as the root SRV view above. The
+//!   vertex index, the stride and the attribute offset are the shader's
+//!   own arithmetic on data in that buffer (per-stream headers), not
+//!   descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
 //!   typed-format loads without an index; structured with the used-resource
@@ -48,12 +64,87 @@
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
 //!   title's view description says. Typed-format loads from heap
 //!   descriptors (1,024 world compute programs, ray-tracing material
-//!   resolves) read raw views this way.
+//!   resolves) read raw views this way. Buffers read by element through
+//!   the resource heap (no used-resource entry, so no stride) are raw too,
+//!   addressed at element × the view's stride + offset, the stride from
+//!   the view-stride table: root SRV `t`[`VIEW_STRIDES`] in
+//!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`], whose dword
+//!   `i` the host keeps at the byte stride of the buffer view at heap
+//!   index `i`.
+//! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
+//!   loads through a descriptor taken from the resource heap itself (root
+//!   type 5, so no used-resource entry) read a raw buffer view, not a
+//!   constant buffer view: the title's constant buffers are 16-byte
+//!   aligned, the host's views 256. The host makes a raw view at the
+//!   constant buffer's address for each constant buffer view in the heap.
+//!   Constant buffers in descriptor tables are read the same way (scalar
+//!   loads and per-lane rows), so tables are never copied per draw.
+//! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
+//!   vertex shader's outputs completes each rectangle with its fourth
+//!   corner `v0 + v2 - v1`, as the console's hardware does.
+//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
+//!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
+//!   many slots, those past its own null, so an index past the heap (data
+//!   still wrong; the console would read whatever memory follows its heap)
+//!   reads nothing instead of faulting the device.
+//! * **Buffer views at computed heap indices** (added 2026-11-24): a
+//!   buffer read through a descriptor the shader takes from the resource
+//!   heap itself first looks up the view-stride table (root SRV
+//!   `t`[`VIEW_STRIDES`], which then covers every index below
+//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
+//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
+//!   unordered access the index below), which the host keeps a null raw
+//!   buffer SRV (UAV). The index comes from data, and a texture descriptor
+//!   read as a buffer one is a wild address (the texture's shifted 8 bits
+//!   down: GPU faults at low addresses).
+//! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`],
+//!   added 2026-11-24): whether the shader takes descriptors from the
+//!   resource heap itself, and unordered access views among them; the
+//!   host then keeps everything the heap's views reach current, and
+//!   copies back what such views may have written.
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//!   host's view at that index must be an R32 integer view. Global loads
+//!   from a root SRV read it raw. 64-bit texture atomics (two dwords per
+//!   value; added 2026-11-24) are SM 6.6's on typed heap resources: the
+//!   host's view must be `R32G32_UINT` (low dword in R) and the device must
+//!   report 64-bit atomics on typed resources (options 9) and on descriptor
+//!   heap resources (options 11), else the pipeline is refused.
+//!
+//! * **Root parameters past the user SGPRs** (added 2026-11-24): a
+//!   compute program whose root signature does not fit its 16 user SGPRs
+//!   loads the rest from memory whose 40-bit address is in user data 0-1;
+//!   the table starts with user-data dword 16. They are user data as any
+//!   other: the host fills dword `index` as above.
+//! * What shaders write through a root UAV is the title's to see.
+//! * **Title memory** (added 2026-11-24, decision 0005's unified-memory
+//!   item): accesses at addresses the program computes (pointers in root
+//!   constants or loaded from memory, BVH nodes) go through a page table,
+//!   the root SRV `t0` in [`MEMORY_SPACE`] ([`HostShader::memory`]), dwords:
+//!   4096 level-1 entries for address bits 28-39 (a level-2 block number,
+//!   0 for none), then blocks of 4096 entries for bits 16-27 (64 KiB pages),
+//!   two dwords each: the resource-heap index of a raw SRV of the host
+//!   memory holding the page, whose raw UAV is the next index, and the low
+//!   dword of the title address that memory starts at (byte offset =
+//!   address low dword - it). Block 0 names null views (its entry 0 is
+//!   how the shader tells a miss); addresses at or above 2^40 use it. The
+//!   root UAV `u0` in [`MEMORY_SPACE`] ([`HostShader::memory_writes`]) takes
+//!   bit `block × 4096 + page` for each page a shader writes (pages of an
+//!   access's first and last byte: what the host copies back) and for each
+//!   page with no copy an access reached, or for an address whose 256 MiB
+//!   region has no block, bit `level-1 index` (block 0's bits). Reads there
+//!   give 0, writes are dropped. In such a program (and one with root
+//!   parameters past its user SGPRs) root SRVs and UAVs are title memory
+//!   too: no root views; the shader reads their addresses as user data
+//!   (root type [`RootType::Descriptor`] in [`HostShader::user_data`],
+//!   dword 0 the address's low dword, 1 the high), and the host must have
+//!   a copy holding each such address.
+//! * **View addresses** ([`HostShader::view_addresses`]): a buffer
+//!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
+//!   come from the root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap
+//!   index, two dwords, the buffer view's title address (high dword bits
+//!   0-15; stride bits 0), zeros for no buffer view.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -76,14 +167,28 @@
 //!   console never exports them).
 
 mod bitcode;
+#[cfg(all(test, windows))]
+mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod rect;
+pub use rect::rectangle_gs;
+#[cfg(all(test, windows))]
+mod memory_tests;
 mod sampler;
+#[cfg(all(test, windows))]
+mod semantics_tests;
 mod shader;
+#[cfg(all(test, windows))]
+mod stride_tests;
+#[cfg(all(test, windows))]
+mod synthetic_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -97,7 +202,10 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
+    USER_DATA_SPACE, VIEW_STRIDES,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -153,9 +261,31 @@ pub struct HostShader {
     /// Root CBVs the shader reads: root parameter indices, each bound as
     /// `b<index>` in [`ROOT_CBV_SPACE`].
     pub root_cbvs: Vec<u8>,
-    /// Root SRVs (raw buffers) the shader reads: `t<index>` in
-    /// [`ROOT_CBV_SPACE`].
+    /// Root SRVs (raw buffers) the host binds as root descriptors: `t<index>`
+    /// in [`ROOT_CBV_SPACE`] (the host's own tables, and title root SRVs in
+    /// programs using title memory; others are views, module notes).
     pub root_srvs: Vec<u8>,
+    /// Root UAVs (raw buffers) the host binds as root descriptors:
+    /// `u<index>` in [`ROOT_CBV_SPACE`] (likewise).
+    pub root_uavs: Vec<u8>,
+    /// Whether the shader reads title memory at addresses it computes: the
+    /// host binds the page table `t0` in [`MEMORY_SPACE`] (module notes,
+    /// "Title memory").
+    pub memory: bool,
+    /// Whether the host binds the page bitmap `u0` in [`MEMORY_SPACE`]
+    /// (pages written and pages missed): whenever [`HostShader::memory`].
+    pub memory_writes: bool,
+    /// Whether it reads buffer views' title addresses from their
+    /// descriptors: the host binds the view addresses `t1` in
+    /// [`MEMORY_SPACE`] (module notes, "Title memory").
+    pub view_addresses: bool,
+    /// Whether it takes descriptors from the resource heap at indices it
+    /// computes (root type 5, not through a table): the host cannot tell
+    /// which views it reads, so every view in the heap must be current.
+    pub heap: bool,
+    /// Whether some of those are unordered access views: it may write
+    /// through any of the heap's.
+    pub heap_writes: bool,
 }
 
 impl HostShader {
@@ -172,6 +302,17 @@ impl HostShader {
     }
 }
 
+/// [`UserData::dword`] of a root descriptor's entry that takes the heap
+/// index of the host's raw SRV of it (module notes, "Root SRVs and root
+/// UAVs"); dwords 0 and 1 are its address (programs using title memory).
+pub const ROOT_SRV_VIEW: u32 = 2;
+/// As [`ROOT_SRV_VIEW`], for the raw UAV of a root UAV.
+pub const ROOT_UAV_VIEW: u32 = 3;
+/// [`UserData::dword`] of a root descriptor's entry that takes its
+/// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
+/// names.
+pub const ROOT_VIEW_OFFSET: u32 = 4;
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -179,9 +320,12 @@ pub struct UserData {
     pub index: u32,
     /// Root parameter index in the title's root signature.
     pub slot: u8,
-    /// `Constants` or `Table` (see the module notes for the value).
+    /// `Constants`, `Table` or `Descriptor` (see the module notes for the
+    /// value).
     pub root: RootType,
-    /// Dword within the parameter.
+    /// Dword within the parameter; for a root descriptor
+    /// [`ROOT_SRV_VIEW`], [`ROOT_UAV_VIEW`] or [`ROOT_VIEW_OFFSET`] name
+    /// its view's heap index or its offset in that view instead.
     pub dword: u32,
 }
 
@@ -191,6 +335,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()
@@ -204,10 +349,9 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let st = structure::structure(&p);
+    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
@@ -280,17 +424,28 @@ pub fn emit(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = |st, res| lower::Parts {
         native,
         p,
         st,
         io,
         res,
-        inputs,
-        outputs,
-        prims,
+        inputs: inputs.clone(),
+        outputs: outputs.clone(),
+        prims: prims.clone(),
         mesh_stride,
-    })?;
+    };
+    let l = match lower::lower(&parts(st, res)) {
+        // Discarded lanes kept on as helpers can read what no surviving
+        // lane does (a register only killed lanes skipped writing); such a
+        // program kills them as the console does (`structure::killing`).
+        Err(_) if !st.discards.is_empty() => {
+            let st = structure::killing(p)?;
+            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+            lower::lower(&parts(&st, &res))?
+        }
+        l => l?,
+    };
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -310,6 +465,12 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
     })
 }
 
@@ -568,6 +729,12 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -578,6 +745,12 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                memory: false,
+                memory_writes: false,
+                view_addresses: false,
+                heap: false,
+                heap_writes: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -693,6 +866,247 @@ mod tests {
         assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
         let sample = psv_of(1 << 0);
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
+    }
+
+    /// Emits a pixel program of `words` with these inputs and signatures.
+    fn emit_pixel(
+        words: &[u32],
+        inputs: Vec<crate::native::PsInput>,
+        input_addr: u32,
+        isg1: &[u8],
+        osg1: &[u8],
+    ) -> Result<HostShader, ShaderError> {
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs,
+                input_addr,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, isg1), (FourCC::OSG1, osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native)?;
+        let out = emit(&c, &native, &p, &st, &io, &res)?;
+        // dxil.dll, where there is one, checks the module.
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        Ok(out)
+    }
+
+    /// A float4 element per row (16-bit ones declared so in the part).
+    fn rows(elements: &[(&str, u8, bool)], input: bool) -> Vec<u8> {
+        let els: Vec<SigElement> = elements
+            .iter()
+            .enumerate()
+            .map(|(row, &(name, kind, _))| SigElement {
+                name: name.into(),
+                index: if kind == 3 { 0 } else { row as u32 },
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(row as u32),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            })
+            .collect();
+        let mut part = container::signature(&els, input);
+        for (row, &(.., half)) in elements.iter().enumerate() {
+            if half {
+                part[8 + 32 * row + 16] = 6;
+            }
+        }
+        part
+    }
+
+    /// Attribute 0 in row 0, 16-bit (one value per dword) or not.
+    fn texcoord(fp16: bool) -> crate::native::PsInput {
+        crate::native::PsInput {
+            usage: crate::native::Usage::Generic,
+            row: 0,
+            mask: 1,
+            attr: 0,
+            flat: false,
+            fp16,
+            pack2: false,
+            row2: 0,
+        }
+    }
+
+    /// A 16-bit result written over a first interpolation half keeps that
+    /// half's high 16 bits. Both narrow reads and reads retaining those bits
+    /// translate once the live first half has a host value.
+    #[test]
+    fn a_half_over_a_first_interpolation_half_reads_as_a_half() {
+        let program = |read: u32| {
+            let words = [
+                0xD742_0002u32,
+                0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+                0xD75A_0003,
+                0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+                0xCC21_0002,
+                0x0A01_E503, // v_fma_mixlo_f16 v2, sel_lo(v3), 1.0, 0
+                read,        // v4 from v2
+                0xF800_180F,
+                0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
+                0xBF81_0000,
+            ];
+            let isg1 = rows(&[("TEXCOORD", 0, true)], true);
+            let osg1 = rows(&[("SV_Target", 16, false)], false);
+            emit_pixel(&words, vec![texcoord(true)], 1 << 1, &isg1, &osg1)
+        };
+        program(0x7E08_1702).unwrap(); // v_cvt_f32_f16 v4, v2
+        program(0x3408_0490).unwrap(); // v_lshlrev_b32 v4, 16, v2
+        program(0x7E08_0302).unwrap(); // v_mov_b32 v4, v2
+        program(0x3408_0488).unwrap(); // v_lshlrev_b32 v4, 8, v2
+    }
+
+    /// A pixel export before the `done` one, both under a lane guard (EXEC
+    /// narrowed without a branch): the lanes outside it are discarded at the
+    /// `done` export, so the first one stores in every lane. With EXEC
+    /// restored before the `done` export those lanes would write only the
+    /// second target, which stays refused.
+    #[test]
+    fn an_export_before_a_discarding_done_export_stores_unguarded() {
+        let program = |restore: &[u32]| {
+            let mut words = vec![
+                0xBE80_037Eu32, // s_mov_b32 s0, exec_lo
+                0x7C22_0080,    // v_cmpx_lt_f32 exec, 0, v0
+                0xF800_000F,
+                0x0000_0000, // exp mrt0, v0, v0, v0, v0
+            ];
+            words.extend(restore);
+            words.extend([
+                0xF800_181F,
+                0x0000_0000, // exp mrt1, v0, v0, v0, v0 done vm
+                0xBF81_0000,
+            ]);
+            let isg1 = rows(&[("SV_Position", 3, false)], true);
+            let osg1 = rows(&[("SV_Target", 16, false), ("SV_Target", 16, false)], false);
+            emit_pixel(&words, vec![], 1 << 8, &isg1, &osg1)
+        };
+        program(&[]).unwrap();
+        let e = program(&[0xBEFE_0300]).unwrap_err(); // s_mov_b32 exec_lo, s0
+        assert!(e.to_string().contains("a conditional export"), "{e}");
+    }
+
+    /// The compiler reuses the j register (`v_mov` under a kill's EXEC) and
+    /// interpolates in the other lanes: those still hold j, which
+    /// structurisation's lane conditions prove. In the lanes the copy ran
+    /// in, interpolation must use the actual computed weight instead.
+    #[test]
+    fn an_interpolation_after_j_is_reused_in_other_lanes_translates() {
+        let program = |other_lanes: &[u32]| {
+            let mut words = vec![
+                0xBE80_037Eu32, // s_mov_b32 s0, exec_lo
+                0x7C22_0480,    // v_cmpx_lt_f32 exec, 0, v2
+                0x7E02_0280,    // v_mov_b32 v1, 0
+            ];
+            words.extend(other_lanes);
+            words.extend([
+                0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+                0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+                0xBEFE_0300, // s_mov_b32 exec_lo, s0
+                0xF800_180F,
+                0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+                0xBF81_0000,
+            ]);
+            let isg1 = rows(&[("TEXCOORD", 0, false), ("SV_Position", 3, false)], true);
+            let osg1 = rows(&[("SV_Target", 16, false)], false);
+            emit_pixel(&words, vec![texcoord(false)], 1 << 1 | 1 << 8, &isg1, &osg1)
+        };
+        let safe = program(&[0x8A7E_7E00]).unwrap(); // s_andn2_b32 exec_lo, s0, exec_lo
+        let features = |s: &HostShader| {
+            let c = Container::parse(&s.dxil).unwrap();
+            u64::from_le_bytes(c.part(FourCC::SFI0).unwrap().data.try_into().unwrap())
+        };
+        assert_eq!(features(&safe) & 0x2_0000, 0);
+        let computed = program(&[]).unwrap();
+        assert_ne!(features(&computed) & 0x2_0000, 0);
+    }
+
+    /// Two elements sharing a row, the one at the higher channels listed
+    /// first (as console signatures have them): the signature part keeps
+    /// them in element order within the row, as the validator does.
+    #[test]
+    fn elements_sharing_a_row_keep_their_order() {
+        let el = |index, col, cols| SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let isg1 = container::signature(&[el(1, 1, 2), el(0, 0, 1)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        emit_pixel(&words, vec![texcoord(false)], 1 << 1, &isg1, &osg1).unwrap();
+    }
+
+    /// An unread float input packed beside the front face (as console
+    /// signatures have it when the float was `nointerpolation`) takes the
+    /// row's constant mode: DXIL wants one mode per row.
+    #[test]
+    fn a_row_keeps_one_interpolation_mode() {
+        let el = |name: &str, kind, comp, row, col| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage: 0,
+            half: false,
+        };
+        let isg1 = container::signature(
+            &[
+                el("TEXCOORD", 0, 9, 0, 0),
+                el("SV_IsFrontFace", 13, 5, 0, 1),
+                el("COLOR", 0, 9, 1, 0),
+            ],
+            true,
+        );
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        let color = crate::native::PsInput {
+            row: 1,
+            ..texcoord(false)
+        };
+        emit_pixel(&words, vec![color], 1 << 1, &isg1, &osg1).unwrap();
     }
 
     /// A pixel shader reading channel z of an input whose element starts at
@@ -1080,6 +1494,12 @@ mod barycentric_tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
@@ -1106,11 +1526,11 @@ mod barycentric_tests {
                 eprintln!("no barycentrics on {backend}; skipped");
                 continue;
             }
-            for case in 0..3 {
-                let ps = if case == 2 {
-                    first_half_high_word_pixel()
-                } else {
-                    first_half_pixel(case == 1)
+            for case in 0..5 {
+                let ps = match case {
+                    0 | 1 => first_half_pixel(case == 1),
+                    2 => first_half_high_word_pixel(),
+                    _ => in_place_weights_pixel(case - 3),
                 };
                 validate(&ps);
                 let (root, pso) = host.pipeline(&vs, &ps).expect("interpolation pipeline");
@@ -1133,10 +1553,11 @@ mod barycentric_tests {
                     let i = (n / 8) as f32 / 16.0 + 0.5 / 16.0;
                     let j = (n % 8) as f32 / 16.0 + 0.5 / 16.0;
                     let partial = 2.0 + i * 4.0;
-                    let want = if case == 1 {
-                        partial + 2.0 + i * 4.0 + j * 8.0
-                    } else {
-                        partial
+                    let want = match case {
+                        1 => partial + 2.0 + i * 4.0 + j * 8.0,
+                        3 => 2.0 + i * 2.0 + j * 8.0,
+                        4 => 2.0 + i * 4.0 + j * 4.0,
+                        _ => partial,
                     };
                     for &got in texel {
                         if case == 2 {
@@ -1210,6 +1631,47 @@ mod barycentric_tests {
         let (features, inputs) = parts(&shader);
         assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
         assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    fn in_place_weights_pixel(index: u32) -> HostShader {
+        let [e0, e1] = exp_mrt0(2);
+        pixel(
+            &[
+                0x1000_00F0 | index << 17 | index << 9, // v_mul_f32 v[index], 0.5, v[index]
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                e0, e1, S_ENDPGM,
+            ],
+            PERSP_CENTER,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn barycentrics_modified_in_place_use_their_computed_weights() {
+        for index in 0..2 {
+            let shader = in_place_weights_pixel(index);
+            assert_eq!(texcoord_mode(&shader), 1);
+            assert_ne!(parts(&shader).0 & 0x2_0000, 0);
+            validate(&shader);
+        }
+    }
+
+    #[test]
+    fn a_first_half_used_as_a_computed_weight_is_retained() {
+        let [e0, e1] = exp_mrt0(2);
+        let shader = pixel(
+            &[
+                0xC804_0000, // p1 in v1 replaces the loaded j with a partial value
+                0xC808_0000, // p1 in v2: the pair's accumulator
+                0xC809_0001, // p2 in v2 uses the computed j in v1
+                e0, e1, S_ENDPGM,
+            ],
+            PERSP_CENTER,
+        )
+        .unwrap();
         assert_eq!(texcoord_mode(&shader), 1);
         validate(&shader);
     }

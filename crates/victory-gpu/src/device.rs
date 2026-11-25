@@ -273,12 +273,18 @@ extern "system" fn check_feature_support(
     const FEATURE_LEVELS: u32 = 2;
     const FORMAT_SUPPORT: u32 = 3;
     const MULTISAMPLE: u32 = 4;
+    const SHADER_MODEL: u32 = 7;
+    const OPTIONS1: u32 = 8;
+    const OPTIONS4: u32 = 23;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
+        SHADER_MODEL => 4,
+        OPTIONS1 => 24,
+        OPTIONS4 => 12,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -318,6 +324,27 @@ extern "system" fn check_feature_support(
             // Format, sample count, flags in; one quality level out for the
             // counts the hardware has.
             q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
+            S_OK
+        }
+        SHADER_MODEL => {
+            // SAFETY: checked size and non-null.
+            let q = unsafe { &mut *data.cast::<u32>() };
+            // The highest asked for, up to 6.6 (the AMD upscaler asks).
+            *q = (*q).min(0x66);
+            S_OK
+        }
+        OPTIONS1 => {
+            let lanes = crate::console::current().compute_units() * 64;
+            // SAFETY: checked size and non-null.
+            unsafe {
+                data.cast::<[u32; 6]>()
+                    .write_unaligned([1, 32, 64, lanes, 1, 1])
+            };
+            S_OK
+        }
+        OPTIONS4 => {
+            // SAFETY: checked size and non-null. Native 16-bit shader operations.
+            unsafe { data.cast::<[u32; 3]>().write_unaligned([0, 0, 1]) };
             S_OK
         }
         _ => feature_levels(data),
@@ -528,5 +555,29 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    /// The queries the AMD upscaler's capability check makes.
+    #[test]
+    fn shader_model_and_wave_options_are_the_consoles() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut model = 0x67u32;
+        assert_eq!(check(device, 7, (&raw mut model).cast(), 4), S_OK);
+        assert_eq!(model, 0x66);
+        model = 0x62;
+        assert_eq!(check(device, 7, (&raw mut model).cast(), 4), S_OK);
+        assert_eq!(model, 0x62);
+        let mut waves = [0u32; 6];
+        assert_eq!(check(device, 8, waves.as_mut_ptr().cast(), 24), S_OK);
+        assert_eq!(waves[..3], [1, 32, 64]);
+        let mut options4 = [0u32; 3];
+        assert_eq!(check(device, 23, options4.as_mut_ptr().cast(), 12), S_OK);
+        assert_eq!(options4[2], 1, "native 16-bit operations");
+        assert_eq!(
+            check(device, 8, waves.as_mut_ptr().cast(), 16),
+            E_INVALIDARG
+        );
     }
 }

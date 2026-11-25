@@ -69,7 +69,7 @@
 //! Unknown versions are rejected so a format change shows up as an error.
 
 use crate::ShaderError::{self, Malformed};
-use crate::dxbc::{u32_at, u64_at};
+use crate::dxbc::{u16_at, u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
@@ -120,6 +120,18 @@ const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
+const FSPX_VERSION: u32 = 1;
+const FSPX_HEADER: usize = 0x10;
+const FSPX_PACKET: u32 = 0;
+const FSPX_CODE: u32 = 6;
+const FSPX_METADATA: u32 = 7;
+const PACKET_THREADS: usize = 0x0c;
+const PACKET_FLAGS: usize = 0x12;
+const PACKET_WAVE32: u16 = 1 << 4;
+const PACKET_RSRC1: usize = 0x14;
+const PACKET_RSRC2: usize = 0x18;
+const FSPX_RECORDS: usize = 0x18;
+const FSPX_RECORD: usize = 32;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -409,8 +421,12 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The native programs in a `DXIL` part's data; empty for the PC layout.
+/// The native programs in a `DXIL` part's data, or in an `ACCC` part's
+/// ([`fspx_program`]); empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+    if part.starts_with(b"FSPX") {
+        return Ok(vec![fspx_program(part)?]);
+    }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }
@@ -430,6 +446,123 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         out.extend(programs(&unpack(blob)?)?);
     }
     Ok(out)
+}
+
+/// The compute program of an `ACCC` part, which a container carries in place
+/// of `DXIL` when another compiler made the native code (the AMD
+/// FidelityFX upscaler's shaders). Layout as observed (offsets from "FSPX"):
+///
+/// ```text
+/// +0x00 "FSPX" u32 version (1), u32 entry count, u32 size; entries of 16 B
+///       from +0x10: u32 kind, u32 offset, u32 size, u32 0
+/// kind 0  pipeline registers, 0x1c B: +0x0c u16 x3 thread-group size,
+///         +0x12 u16 flags (bit 4 wave32), +0x14 COMPUTE_PGM_RSRC1,
+///         +0x18 COMPUTE_PGM_RSRC2
+/// kind 1  pipeline metadata (a hash); kind 6 the GFX10 code
+/// kind 7  program metadata: u32 0x403, u32 size - 0x14, u32 code dwords,
+///         u64 0, u8 0x40, u8 first user-data dword, u8 count of 0x41
+///         records, u8 0; then 32-byte records from +0x18, each a u32 tag:
+///   0x41  a resource the code reads: u8 resource type (as FSSM's used
+///         entries), u8 root type, u16 0, u32 table offset (dwords), u32
+///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
+///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
+///         u32 -1, u32 0
+///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
+///         u8 resource kind (DXIL's), u8 0, u32 register
+///   0x43  the shader hash (16 B); the last record
+/// ```
+pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
+    if u32_at(part, 4)? != FSPX_VERSION {
+        return Err(Malformed("unknown FSPX version"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return Err(Malformed("implausible FSPX entry count"));
+    }
+    let entry = |kind: u32| -> Result<&[u8], ShaderError> {
+        for i in 0..count {
+            let at = FSPX_HEADER + 16 * i;
+            if u32_at(part, at)? == kind {
+                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
+                return bytes(part, offset.into(), size.into())
+                    .ok_or(Malformed("FSPX entry out of bounds"));
+            }
+        }
+        Err(Malformed("FSPX entry missing"))
+    };
+    let packet = entry(FSPX_PACKET)?;
+    let code = entry(FSPX_CODE)?;
+    let meta = entry(FSPX_METADATA)?;
+    if u32_at(meta, 8)? as usize * 4 != code.len() {
+        return Err(Malformed("FSPX code size disagrees"));
+    }
+    let wave64 = u16_at(packet, PACKET_FLAGS)? & PACKET_WAVE32 == 0;
+    // VGPRs in granules of 4 (wave64) or 8 (wave32).
+    let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
+    let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
+    let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    let mut layout: Vec<RootParam> = Vec::new();
+    let mut used = Vec::new();
+    for e in meta
+        .get(FSPX_RECORDS..)
+        .unwrap_or(&[])
+        .as_chunks::<FSPX_RECORD>()
+        .0
+    {
+        match e[0] {
+            0x41 => {}
+            0x42 => continue,
+            0x43 => break,
+            _ => return Err(Malformed("unknown FSPX metadata record")),
+        }
+        let root = RootType::from_raw(e[5].into());
+        let u = UsedResource {
+            kind: match e[4] {
+                0 => ResourceType::Srv,
+                1 => ResourceType::Sampler,
+                2 => ResourceType::Cbv,
+                3 => ResourceType::Uav,
+                n => ResourceType::Other(n),
+            },
+            root,
+            table_offset_dwords: le32(e, 8),
+            lower_bound: le32(e, 12),
+            stride: 0,
+            dwords: e[20],
+            user_data: e[21],
+            slot: e[22],
+        };
+        let sgprs = match root {
+            RootType::Table => 1,
+            RootType::Descriptor => 2,
+            // The code holds its words; no user data.
+            RootType::ImmediateSampler => 0,
+            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
+        };
+        if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs,
+                base_register: u.lower_bound,
+                user_data: u.user_data,
+                slot: u.slot,
+            });
+        }
+        used.push(u);
+    }
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            threads: [threads(0)?, threads(1)?, threads(2)?],
+        }),
+        code: code.to_vec(),
+    })
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
@@ -669,7 +802,7 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -1019,5 +1152,158 @@ mod tests {
         let at = FSSM_HEADER + slot(HwStage::Ls);
         bad_record[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&bad_record))])).is_err());
+    }
+
+    /// A metadata record of a resource the code reads.
+    pub(crate) fn fspx_resource(
+        kind: u8,
+        root: u8,
+        table_offset: u32,
+        register: u32,
+        user_data: u8,
+        slot: u8,
+    ) -> [u8; 32] {
+        let mut r = [0u8; 32];
+        r[0] = 0x41;
+        r[4..6].copy_from_slice(&[kind, root]);
+        r[8..12].copy_from_slice(&table_offset.to_le_bytes());
+        r[12..16].copy_from_slice(&register.to_le_bytes());
+        r[16] = 1;
+        r[20..23].copy_from_slice(&[4, user_data, slot]);
+        r[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        r
+    }
+
+    /// An `ACCC` part's data in the observed layout: `code` as a compute
+    /// program with 16 VGPRs, `rsrc2` and `threads`, and `records`.
+    pub(crate) fn fspx(
+        code: &[u8],
+        rsrc2: u32,
+        threads: [u16; 3],
+        wave32: bool,
+        records: &[[u8; 32]],
+    ) -> Vec<u8> {
+        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let flags = if wave32 { PACKET_WAVE32 } else { 0 };
+        let packet = words(&[
+            0,
+            0,
+            0,
+            u32::from(threads[0]) | u32::from(threads[1]) << 16,
+            u32::from(threads[2]) | u32::from(flags) << 16,
+            // 16 VGPRs either way: 2 granules of 8, or 4 of 4.
+            if wave32 { 1 } else { 3 },
+            rsrc2,
+        ]);
+        let hash = {
+            let mut r = [0u8; 32];
+            r[0] = 0x43;
+            r
+        };
+        let mut meta = words(&[0x403, 0, code.len() as u32 / 4, 0, 0]);
+        let resources = records.iter().filter(|r| r[0] == 0x41).count() as u8;
+        meta.extend_from_slice(&[0x40, 4, resources, 0]);
+        records
+            .iter()
+            .chain([&hash])
+            .for_each(|r| meta.extend_from_slice(r));
+        let len = meta.len() as u32 - 0x14;
+        meta[4..8].copy_from_slice(&len.to_le_bytes());
+        let blobs: [(u32, &[u8]); 4] = [
+            (FSPX_PACKET, &packet),
+            (1, &[0; 0x14]),
+            (FSPX_CODE, code),
+            (FSPX_METADATA, &meta),
+        ];
+        let mut out = vec![0u8; FSPX_HEADER + 16 * blobs.len()];
+        for (i, (kind, blob)) in blobs.iter().enumerate() {
+            let at = out.len().next_multiple_of(16);
+            out.resize(at, 0);
+            let entry = words(&[*kind, at as u32, blob.len() as u32, 0]);
+            out[FSPX_HEADER + 16 * i..FSPX_HEADER + 16 * (i + 1)].copy_from_slice(&entry);
+            out.extend_from_slice(blob);
+        }
+        let header = words(&[
+            u32::from_le_bytes(*b"FSPX"),
+            FSPX_VERSION,
+            4,
+            out.len() as u32,
+        ]);
+        out[..16].copy_from_slice(&header);
+        out
+    }
+
+    #[test]
+    fn reads_fspx_compute_programs() {
+        let code = [0x00, 0x00, 0x81, 0xBF]; // s_endpgm
+        let records = [
+            fspx_resource(3, 3, 0x58, 11, 4, 0),
+            fspx_resource(2, 1, 0, 0, 6, 2),
+            // An immediate sampler: its words are in the code.
+            fspx_resource(1, 4, 0, 0, 0, 0),
+            [0x42; 32],
+        ];
+        let data = fspx(&code, 0x9c, [32, 1, 1], true, &records);
+        let p = &native_programs(&data).unwrap()[0];
+        assert_eq!((p.stage, p.wave64, p.vgprs), (HwStage::Cs, false, 16));
+        assert_eq!(p.code, code);
+        assert_eq!(
+            p.io,
+            StageIo::Cs(ComputeIo {
+                rsrc2: 0x9c,
+                threads: [32, 1, 1]
+            })
+        );
+        let roots: Vec<_> = p
+            .layout
+            .iter()
+            .map(|r| (r.root, r.sgprs, r.user_data, r.slot))
+            .collect();
+        assert_eq!(
+            roots,
+            [(RootType::Table, 1, 4, 0), (RootType::Descriptor, 2, 6, 2)]
+        );
+        assert_eq!(p.used.len(), 3);
+        let uav = p.used[0];
+        assert_eq!(
+            (
+                uav.kind,
+                uav.table_offset_dwords,
+                uav.lower_bound,
+                uav.dwords
+            ),
+            (ResourceType::Uav, 0x58, 11, 4)
+        );
+        assert_eq!(p.used[2].root, RootType::ImmediateSampler);
+        let wave64 = fspx(&code, 0, [64, 1, 1], false, &[]);
+        assert!(native_programs(&wave64).unwrap()[0].wave64);
+    }
+
+    #[test]
+    fn rejects_corrupt_fspx_parts() {
+        let code = [0x00, 0x00, 0x81, 0xBF];
+        let good = fspx(&code, 0, [64, 1, 1], false, &[]);
+        let corrupt = |at: usize, byte: u8| {
+            let mut data = good.clone();
+            data[at] = byte;
+            native_programs(&data)
+        };
+        assert!(corrupt(4, 2).is_err(), "unknown version");
+        assert!(corrupt(8, 0xFF).is_err(), "entry count");
+        // The code entry's size no longer matches the metadata's count.
+        assert!(corrupt(FSPX_HEADER + 32 + 8, 8).is_err(), "code size");
+        let mut root_constants = fspx(
+            &code,
+            0,
+            [64, 1, 1],
+            false,
+            &[fspx_resource(2, 0, 0, 0, 4, 0)],
+        );
+        assert!(
+            native_programs(&root_constants).is_err(),
+            "unknown root type"
+        );
+        root_constants.truncate(40);
+        assert!(native_programs(&root_constants).is_err(), "truncated");
     }
 }

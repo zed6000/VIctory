@@ -3,7 +3,10 @@
 //! offsets or byte-pattern signatures). What may and may not be stored here
 //! is defined in docs/asset-policy.md.
 
+pub mod cityhash;
+pub mod pipelines;
 pub mod sgd5;
+pub mod shaderpack;
 
 /// A specific build of the Grand Theft Auto VI executable we know how to run.
 #[derive(Debug, Clone, Copy)]

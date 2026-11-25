@@ -59,6 +59,10 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// A shader-visible heap in the title's memory, tracked: the title also
+    /// copies descriptors into it itself, as bytes (`sync_heaps`).
+    #[cfg(windows)]
+    written: Option<crate::watch::Tracked>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -148,6 +152,44 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Mirrors what the title wrote into its shader-visible heaps without a
+/// call: Grand Theft Auto VI copies descriptors (our records) into its heap
+/// as bytes, so only a change of its memory shows them. Each slot of a page
+/// written since the last sync is made again if its record changed (in the
+/// world 1,300-14,400 slots a frame, against a few hundred views made by
+/// calls). Called before each submission: shaders take descriptors from the
+/// heap at indices in their data, where a slot never mirrored reads nothing.
+#[cfg(windows)]
+pub(crate) fn sync_heaps() {
+    // Held throughout: a heap is not dropped while its slots are made.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(written), Some(step)) =
+            (heap.host.get(), &heap.written, increment(heap.desc.kind))
+        else {
+            continue;
+        };
+        let step = u64::from(step);
+        for (from, to) in written.take(start as usize, usize::MAX) {
+            // By page: one with nothing mapped (the title unmaps heap pages
+            // too) holds no records.
+            let page_size = crate::watch::PAGE;
+            for page in (from & !(page_size - 1)..to).step_by(page_size) {
+                let (page, end) = (page.max(from), (page + page_size).min(to));
+                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
+                    continue;
+                }
+                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                for index in first..last.min(u64::from(heap.desc.count)) {
+                    host.mirror(index as u32, start + index * step, false);
+                }
+            }
+        }
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
@@ -159,6 +201,20 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     {
         host.release(first, n);
     }
+}
+
+/// Runs `f` on the host heap behind the title heap at `heap` while that
+/// heap cannot be released; None if it is gone or has no host heap.
+#[cfg(windows)]
+pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(_, _, h)| h == heap) {
+        return None;
+    }
+    // SAFETY: registered heaps are live (removed when dropped, which waits
+    // for the lock we hold).
+    let host = unsafe { &*(heap as *const Heap) }.host.get()?.as_ref()?;
+    Some(f(host))
 }
 
 #[cfg(windows)]
@@ -293,22 +349,6 @@ pub(crate) enum View {
     /// access, the resource description, then the view's (the plain one
     /// followed by the memory address and console fields).
     Placed(bool, [u32; 14], [u32; 16]),
-}
-
-impl View {
-    /// Whether the view reads buffer memory (constant buffers, buffer views
-    /// of resources or of memory) or memory the title placed a texture in:
-    /// such views get host slots only for draws.
-    #[cfg(windows)]
-    fn is_buffer(&self) -> bool {
-        match self {
-            View::Constant(..) | View::Placed(..) => true,
-            View::Shader(r, _) | View::Unordered(r, _, _) => {
-                crate::resource::buffer_bytes(*r as This).is_some()
-            }
-            View::Sampler(_) | View::ConsoleSampler(_) => false,
-        }
-    }
 }
 
 /// Every distinct view in use; a descriptor holds a tag, an index into it
@@ -624,6 +664,10 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        written: (placed && visible)
+            .then(|| crate::watch::track(start as usize, size as usize, true))
+            .flatten(),
     });
     #[cfg(windows)]
     if visible {
@@ -758,6 +802,41 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// A record the title copies into its shader-visible heap as bytes (no
+    /// call) is made on the host at the next sync, and only then.
+    #[cfg(windows)]
+    #[test]
+    fn records_copied_as_bytes_are_made_at_the_next_sync() {
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: memory as u64,
+            size: 64 * 16,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            // Our record, written where no heap sees it, then copied in.
+            let mut elsewhere = [0u64; 2];
+            let at = elsewhere.as_mut_ptr() as u64;
+            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            let slot = memory as u64 + 5 * 16;
+            // SAFETY: 16 bytes of each, ours; the heap's page is guarded
+            // (our handler opens it).
+            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot as *mut u8, 16) };
+            assert!(!host.made(5));
+            sync_heaps();
+            assert!(host.made(5), "made at the sync");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
     }
 
     /// Grand Theft Auto VI places its shader-visible heap in its own memory

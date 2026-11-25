@@ -208,6 +208,9 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// Structures chosen between by a condition: `(cond, other)` by the
+    /// one taken where `cond` holds. [`Module::extract`] chooses the field.
+    pub chosen: HashMap<V, (V, V)>,
 }
 
 impl Module {
@@ -406,7 +409,14 @@ impl Module {
             TypeDef::Array(_, t) => *t,
             t => panic!("extractvalue from {t:?}"),
         };
-        self.push(block, ty, Op::Extract(agg, index))
+        let x = self.push(block, ty, Op::Extract(agg, index));
+        match self.chosen.get(&agg).copied() {
+            Some((cond, other)) => {
+                let y = self.push(block, ty, Op::Extract(other, index));
+                self.select(block, cond, x, y)
+            }
+            None => x,
+        }
     }
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {

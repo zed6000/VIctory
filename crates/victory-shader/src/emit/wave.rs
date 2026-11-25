@@ -30,12 +30,15 @@ pub(crate) enum Op {
     Or,
     And,
     Xor,
+    /// `v_add_f16`: on the low halves (see [`Sym::Half`]).
+    AddH,
 }
 
 impl Op {
     fn of(name: &str) -> Option<Op> {
         Some(match name {
-            "v_add_nc_u32" => Op::AddU,
+            // The low dwords of a 64-bit sum (the carry is not followed).
+            "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
@@ -60,12 +63,13 @@ impl Op {
             Op::MaxI => k == 0x8000_0000,
             Op::MinF => k == 0x7F80_0000,
             Op::MaxF => k == 0xFF80_0000,
+            Op::AddH => k & 0x7FFF == 0,
         }
     }
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::Xor | Op::AddH)
     }
 }
 
@@ -86,6 +90,18 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
+    /// A 16-bit operation's result: the low half is `op` over `lanes` of
+    /// the low halves of `mask ? src : ident`; the high half is that of
+    /// lane `hi`'s `mask ? src : ident` (16-bit results keep the
+    /// register's high half).
+    Half {
+        op: Op,
+        src: Value,
+        mask: Value,
+        ident: u32,
+        lanes: u64,
+        hi: u32,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -99,6 +115,9 @@ pub(crate) enum Shape {
     Active(Op, Value, Value, u32),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
+    /// [`Sym::Half`] over every lane: `op`, src, mask, identity, the lane
+    /// giving the high half.
+    Half(Op, Value, Value, u32, u32),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -227,6 +246,69 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
             }
         }
         _ => Sym::Unknown,
+    }
+}
+
+/// A lane of 16-bit `op` on the low halves of `a` and `b`, the high half
+/// kept from the destination's `old` value.
+fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
+    // A low half: the identity, or `op` over lanes of one masked source.
+    let low = |s: Sym| match s {
+        Sym::K(k) if op.identity(k) => Some(None),
+        Sym::Red {
+            op: None,
+            src,
+            mask,
+            ident,
+            lanes,
+        } if op.identity(ident) => Some(Some((src, mask, ident, lanes))),
+        Sym::Half {
+            op: o,
+            src,
+            mask,
+            ident,
+            lanes,
+            ..
+        } if o == op => Some(Some((src, mask, ident, lanes))),
+        _ => None,
+    };
+    let (src, mask, ident, hi) = match old {
+        Sym::Red {
+            op: None,
+            src,
+            mask,
+            ident,
+            lanes,
+        } if lanes.is_power_of_two() => (src, mask, ident, lanes.trailing_zeros()),
+        Sym::Half {
+            src,
+            mask,
+            ident,
+            hi,
+            ..
+        } => (src, mask, ident, hi),
+        _ => return Sym::Unknown,
+    };
+    let (Some(x), Some(y)) = (low(a), b.and_then(low)) else {
+        return Sym::Unknown;
+    };
+    let mut lanes = 0;
+    for (s, m, i, l) in [x, y].into_iter().flatten() {
+        if (s, m, i) != (src, mask, ident) || lanes & l != 0 {
+            return Sym::Unknown;
+        }
+        lanes |= l;
+    }
+    if lanes == 0 {
+        return Sym::Unknown;
+    }
+    Sym::Half {
+        op,
+        src,
+        mask,
+        ident,
+        lanes,
+        hi,
     }
 }
 
@@ -468,6 +550,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
+            ("v_add_f16", Some(a)) if v.opsel == 0 => {
+                let b = src(1).unwrap_or_default();
+                (0..wave as usize)
+                    .map(|l| half(Op::AddH, a[l], b.get(l).copied(), old[l]))
+                    .collect()
+            }
             (n, Some(a)) => match (Op::of(n), src(1)) {
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
@@ -530,6 +618,14 @@ fn shapes(
             ident,
             lanes,
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+        Sym::Half {
+            op,
+            src,
+            mask,
+            ident,
+            lanes,
+            hi,
+        } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
         _ => None,
     };
     for (v, s) in uni {

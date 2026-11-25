@@ -370,6 +370,64 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Where each slice (section, page index) is mapped: the addresses of
+    /// its page in every view showing it (the GPU side's change tracking
+    /// follows writes through one view to the others, `aliases`).
+    shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+impl Slice {
+    /// The key of page `k` of the slices from this one on in `shown`.
+    fn key(&self, k: usize) -> (usize, usize) {
+        (Arc::as_ptr(&self.section) as usize, self.index + k)
+    }
+}
+
+/// Every address of a title view showing a page that title memory at
+/// `[at, at + len)` shows, except the page's own address: pushed to `out`
+/// as (page address, other address). The GPU side's change tracking
+/// (`victory_gpu::watch`) marks writes there too.
+pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
+    let physical = physical();
+    let end = at.saturating_add(len);
+    let first = physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| *base + size > at)
+        .map(|(base, _)| *base);
+    let starts = first.into_iter().chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
+    for base in starts.collect::<Vec<_>>() {
+        let (size, slice) = &physical.views[&base];
+        let (from, to) = (at.max(base), end.min(base + size));
+        for page in (from / PAGE..to.div_ceil(PAGE)).map(|p| p * PAGE) {
+            let k = (page - base) / PAGE;
+            if let Some(addresses) = physical.shown.get(&slice.key(k)) {
+                out.extend(addresses.iter().filter(|&&a| a != page).map(|&a| (page, a)));
+            }
+        }
+    }
+}
+
+/// The addresses of title views showing `pages` (page numbers): writes into
+/// them through our own views must be reported there.
+fn shown_at(pages: &[usize]) -> Vec<usize> {
+    let physical = physical();
+    pages
+        .iter()
+        .filter_map(|p| physical.pages.get(p))
+        .filter_map(|slice| physical.shown.get(&slice.key(0)))
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// Reports writes into physical pages through our own views at every title
+/// view showing them (DirectStorage's page destinations).
+fn report_written(shown: &[usize]) {
+    for &page in shown {
+        drop(victory_gpu::kernel_will_write(page, PAGE));
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -542,6 +600,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -551,6 +610,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
+    report_written(&shown);
     true
 }
 
@@ -561,6 +621,14 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    /// Title views showing the pages, told when the window is done.
+    shown: Vec<usize>,
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        report_written(&self.shown);
+    }
 }
 
 impl PageWindow {
@@ -584,6 +652,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
+        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
     })
 }
 
@@ -728,6 +797,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    for k in 0..len / PAGE {
+        let shown = physical.shown.entry(slice.key(k)).or_default();
+        // Pages shown elsewhere already: guarded here too if they are there.
+        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
+        shown.push(base + k * PAGE);
+    }
     physical.views.insert(base, (len, slice));
     true
 }
@@ -806,6 +881,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        for k in 0..size / PAGE {
+            let key = slice.key(k);
+            if let Some(addresses) = physical.shown.get_mut(&key) {
+                addresses.retain(|&a| a != at + k * PAGE);
+                if addresses.is_empty() {
+                    physical.shown.remove(&key);
+                }
+            }
+        }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1071,6 +1155,15 @@ mod tests {
             assert_eq!(at(b, 1).cast::<u8>().read(), 7);
             a.cast::<u8>().write(1);
         }
+        // Each mapping knows the other (the GPU side's change tracking).
+        let others = |p: *mut c_void| {
+            let mut out = Vec::new();
+            aliases(p as usize, PAGE, &mut out);
+            out.into_iter().map(|(_, a)| a).collect::<Vec<_>>()
+        };
+        assert_eq!(others(at(a, 2)), [at(b, 1) as usize]);
+        assert_eq!(others(at(b, 1)), [at(a, 2) as usize]);
+        assert!(others(a).is_empty());
         // Writes into pages (DirectStorage's) show through their views.
         assert!(write_physical(&pages[2..], 1, &[9]));
         // SAFETY: mapped read-write.
@@ -1105,7 +1198,11 @@ mod tests {
         assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { b.cast::<u8>().read() }, 7);
+        let mut both = others(at(a, 2));
+        both.sort_unstable();
+        assert_eq!(both, [b as usize, at(b, 1) as usize]);
         assert!(map_alias(b as u64, 0, PAGE as u64));
+        assert_eq!(others(at(a, 2)), [at(b, 1) as usize], "unmapped views are forgotten");
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
