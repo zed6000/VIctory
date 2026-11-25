@@ -10784,7 +10784,16 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
+                // Keep the counted indexed-write proof ahead of lazy input
+                // loading: the original value is never observed on this edge.
+                let overwritten_input = read
+                    && !bit
+                    && self.x.io.inputs.iter().any(|&(v, input)| {
+                        v == arg && matches!(input, Input::Barycentric { .. })
+                    })
+                    && self.overwritten_movreld_edge(b, phi, n).is_some();
                 if read
+                    && !overwritten_input
                     && !self.vals.contains_key(&arg)
                     && !self.never_taken(q, b)
                     && !self.dead_on_edge(b, n, phi.reg)
@@ -10792,6 +10801,7 @@ impl<'a> Lower<'a> {
                     let _ = self.lazy_barycentric(arg);
                 }
                 let x = match (self.vals.get(&arg).copied(), bit) {
+                    _ if overwritten_input => self.s.m.undef(self.s.t.i32),
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.
@@ -10803,13 +10813,6 @@ impl<'a> Lower<'a> {
                         } else {
                             self.s.m.i32(0)
                         }
-                    }
-                    // An input an unguarded counted `v_movreld` loop overwrites
-                    // before anything reads it (PR #457).
-                    (Some(Val::Missing("barycentrics read directly")), false)
-                        if read && self.overwritten_movreld_edge(b, phi, n).is_some() =>
-                    {
-                        self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Bit(_)), false) if read => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));

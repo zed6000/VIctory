@@ -792,35 +792,32 @@ mod tests {
             let st = structure::structure(&p).unwrap();
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res);
-            if matches!(case, Complete | NonzeroBase) {
-                let shader = shader.unwrap();
-                assert!(
-                    Container::parse(&shader.dxil)
-                        .unwrap()
-                        .part(FourCC::DXIL)
-                        .is_some()
-                );
-                #[cfg(windows)]
-                if let Ok(mut validator) =
-                    validator::Validator::load(validator::Validator::default_path().as_deref())
-                {
-                    let mut dxil = shader.dxil;
-                    validator.validate(&mut dxil).unwrap();
-                    eprintln!("synthetic {case:?} SDK valid bytes={}", dxil.len());
-                }
-            } else {
-                eprintln!("synthetic {case:?} {:?}", shader.as_ref().err());
-                assert!(
-                    matches!(
-                        shader,
-                        Err(ShaderError::Unsupported {
-                            what: "barycentrics read directly",
-                            ..
-                        })
-                    ),
-                    "{case:?}"
-                );
+            let shader = emit(&c, &native, &p, &st, &io, &res)
+                .unwrap_or_else(|e| panic!("{case:?}: {e}"));
+            let container = Container::parse(&shader.dxil).unwrap();
+            assert!(container.part(FourCC::DXIL).is_some());
+            // A complete overwrite needs no original input. Every other case
+            // must retain it; direct barycentric reads are now supported.
+            let needs_input = !matches!(case, Complete | NonzeroBase);
+            let features = u64::from_le_bytes(
+                container.part(FourCC::SFI0).unwrap().data.try_into().unwrap(),
+            );
+            assert_eq!(features & 0x2_0000 != 0, needs_input, "{case:?}");
+            let inputs = signature(container.part(FourCC::ISG1).unwrap().data).unwrap();
+            assert_eq!(
+                inputs.iter().filter(|e| e.kind == 28).count(),
+                usize::from(needs_input),
+                "{case:?}"
+            );
+            #[cfg(windows)]
+            if let Ok(mut validator) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                let mut dxil = shader.dxil;
+                validator
+                    .validate(&mut dxil)
+                    .unwrap_or_else(|e| panic!("{case:?}: {e}"));
+                eprintln!("indexed input {case:?}: validated, barycentrics={needs_input}");
             }
         }
     }
