@@ -90,6 +90,44 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
+/// What a geometry shader declares (`GSState`, `PSV0`): its one output
+/// stream is stream 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Geometry {
+    /// DXIL input primitive: 1 points, 2 lines, 3 triangles, 6 lines with
+    /// adjacency, 7 triangles with adjacency.
+    pub input: u32,
+    /// Output topology: 1 points, 3 line strips, 5 triangle strips.
+    pub topology: u32,
+    /// The most vertices one run emits.
+    pub max_vertices: u32,
+    /// Runs per input primitive (`[instance(n)]`).
+    pub instances: u32,
+}
+
+impl Geometry {
+    /// Triangles in, triangle strips out, one run per primitive.
+    pub fn triangles(max_vertices: u32) -> Self {
+        Geometry {
+            input: 3,
+            topology: 5,
+            max_vertices,
+            instances: 1,
+        }
+    }
+
+    /// The vertices of one input primitive.
+    pub fn input_vertices(&self) -> u32 {
+        match self.input {
+            1 => 1,
+            2 => 2,
+            6 => 4,
+            7 => 6,
+            _ => 3,
+        }
+    }
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -100,9 +138,9 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
-    /// A geometry shader taking triangles and emitting triangle strips of
-    /// at most this many vertices (`rect`).
-    pub gs: Option<u32>,
+    /// A geometry shader: the generated one of rectangle lists (`rect`) or
+    /// a title's (the console's merged geometry stage).
+    pub gs: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -875,11 +913,12 @@ impl Shader {
                 }
             }
         }
-        // Geometry state (tag 1): triangles in, maximum vertices, stream
-        // mask, triangle strips out, one instance.
-        if let Some(max) = self.gs {
+        // Geometry state (tag 1): input primitive, maximum vertices, stream
+        // mask (stream 0), output topology, instances.
+        if let Some(gs) = self.gs {
             props.push(i32c(&mut self, 1));
-            let state = [3, max, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            let state = [gs.input, gs.max_vertices, 1, gs.topology, gs.instances]
+                .map(|n| Some(i32c(&mut self, n)));
             props.push(self.m.md_node(state.to_vec()));
         }
         if let Some(n) = self.wave_size {
