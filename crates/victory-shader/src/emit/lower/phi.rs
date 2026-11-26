@@ -310,6 +310,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            gs: None,
         })
     }
 

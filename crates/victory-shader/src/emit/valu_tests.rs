@@ -2511,6 +2511,7 @@ fn build_wave32_cs(body: &[u32]) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        gs: None,
     })
     .expect("lower");
 
