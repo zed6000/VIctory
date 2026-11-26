@@ -4061,6 +4061,25 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether `inst` is the `s_andn2_wrexec` of a loop of one block that
+    /// `s_cbranch_execnz` closes (the console compiler's waterfall loop):
+    /// the loop is left only once no lane remains, so the SCC it writes
+    /// (EXEC != 0) is false wherever a block after the loop reads it. A phi
+    /// of the block taking it would see a later iteration's: not then.
+    fn leaves_with_no_lane(&self, inst: &Inst) -> bool {
+        let b = self.cur_ir;
+        let block = &self.x.p.blocks[b];
+        let n = block.insts.len();
+        matches!(inst.name(), "s_andn2_wrexec_b32" | "s_andn2_wrexec_b64")
+            && n >= 2
+            && std::ptr::eq(&block.insts[n - 2], inst)
+            && block.insts[n - 1].name() == "s_cbranch_execnz"
+            && matches!(block.exit, Exit::Branch { taken, .. } if taken == b)
+            && inst
+                .write(Reg::Scc)
+                .is_some_and(|scc| block.phis.iter().all(|phi| !phi.args.contains(&scc)))
+    }
+
     fn is_mask(&self, v: Option<Value>) -> bool {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v))
     }
@@ -4077,6 +4096,16 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            if let Some(scc) = scc
+                && self.leaves_with_no_lane(inst)
+            {
+                for &(_, v) in &inst.writes {
+                    self.vals.insert(v, Val::Missing(LANE_MASK));
+                }
+                let none = self.s.m.bool(false);
+                self.vals.insert(scc, Val::Bit(none));
+                return Ok(());
+            }
             return Err(LANE_MASK);
         }
         if matches!(

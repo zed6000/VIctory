@@ -324,6 +324,32 @@ fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
     );
 }
 
+/// The console compiler's waterfall loop (run the lanes holding the first
+/// lane's value, drop them, repeat): it is left once `s_andn2_wrexec` leaves
+/// no lane, so the SCC that wrote it is 0 after the loop, and an
+/// `s_cselect` there picks its second source.
+#[test]
+fn the_scc_a_waterfall_loop_leaves_is_false() {
+    let shader = build_valu_cs(&[
+        s_mov_b32(20, 126),                     // s20 = exec_lo
+        s_mov_b32(21, 126),                     // s21 = exec_lo
+        vop1(0x002, 22, vgpr(1)),               // loop: v_readfirstlane_b32 s22, v1
+        0x7C00_0000 | 0xD2 << 17 | 1 << 9 | 22, // v_cmpx_eq_u32 s22, v1
+        0xBE95_4715,                            // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFFC,                            // s_cbranch_execnz -> loop
+        s_mov_b32(126, 20),                     // exec_lo = s20
+        sop2(0x0A, 23, 1, 2),                   // s_cselect_b32 s23, s1, s2
+        vop1(0x001, 0, sgpr(23)),               // v0 = s23
+    ]);
+    run_cases(
+        &shader,
+        &[[3, 1, 2, 0], [0, 7, 9, 0]],
+        |backend, _, inputs, actual| {
+            assert_eq!(actual, inputs[2], "{backend}");
+        },
+    );
+}
+
 #[test]
 fn v_fma_f16_rounds_once_and_preserves_other_half() {
     use super::host::Stride;
