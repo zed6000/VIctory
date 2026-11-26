@@ -11,9 +11,12 @@
 //! the states the pack's register images encode, and for rasterisers and
 //! depth-stencil an enumeration of each field's usual values. A description
 //! counts only if its hash is the record's. (Of 25,471 records these name
-//! all three states of 21,036; one-byte changes of the named descriptions
-//! and a blend enumeration named states of 17 and 32 more records, none
-//! drawn with in the runs measured, and were left out.)
+//! all three states of 25,465: every rasteriser, from the register images,
+//! 852 records of which no enumeration reached for their clamped,
+//! fractional slope biases, and all depth-stencil states but 2 (3 records)
+//! once what the registers do not keep is tried; a blend enumeration named
+//! states of 32 more records, none drawn with in the runs measured, and was
+//! left out.)
 //!
 //! Compact layouts (D3D12 enum values throughout):
 //!
@@ -85,8 +88,7 @@ impl Named {
         }
         named.finding = "registers";
         named.name_from_registers(&mut want, pack);
-        // Rasterisers have no register image here; depth states some
-        // registers do not keep.
+        // What the registers do not keep.
         named.finding = "enumeration";
         depth_space(|b| named.try_depth(&mut want, &b));
         raster_space(|b| named.try_raster(&mut want, &b));
@@ -110,7 +112,14 @@ impl Named {
     /// depth func with depth off): those are enumerated.
     fn name_from_registers(&mut self, want: &mut Wanted, pack: &Pack) {
         let mut tried = HashSet::new();
+        let mut tried_raster = HashSet::new();
         for g in pack.graphics() {
+            if want.raster.contains(&g.rasterizer_hash)
+                && let Some(regs) = raster_registers(g.packet)
+                && tried_raster.insert((g.rasterizer_hash, regs))
+            {
+                raster_from_registers(&regs, |b| self.try_raster(want, &b));
+            }
             let (Some(regs), Some(formats)) = (registers(g.packet), g.target_formats()) else {
                 continue;
             };
@@ -230,6 +239,55 @@ fn registers(packet: &[u8]) -> Option<[u32; 14]> {
     Some(regs)
 }
 
+/// The rasteriser registers of a pack record's register image, 0x28 bytes
+/// into the fixed part (see [`registers`]): `PA_CL_CLIP_CNTL`,
+/// `PA_SU_SC_MODE_CNTL`, two words not used here, `PA_SU_POLY_OFFSET_CLAMP`,
+/// `_FRONT_SCALE` and `_FRONT_OFFSET`.
+fn raster_registers(packet: &[u8]) -> Option<[u32; 7]> {
+    let word = |o: usize| Some(u32::from_le_bytes(packet.get(o..o + 4)?.try_into().ok()?));
+    let base = if word(4)? == 4 { 0x74 } else { 0xc8 };
+    let mut regs = [0; 7];
+    for (i, r) in regs.iter_mut().enumerate() {
+        *r = word(base + 0x28 + 4 * i)?;
+    }
+    Some(regs)
+}
+
+/// The rasteriser the registers encode: cull and winding from the mode
+/// control, depth clip unless the clip control turns both z clips off, the
+/// clamp as it is, the slope bias as the scale over 16 and the integer bias
+/// as the offset. Solid fill only. The multisample and line modes are not
+/// kept here; those are enumerated.
+fn raster_from_registers(regs: &[u32; 7], mut f: impl FnMut([u8; RASTER])) {
+    let [clip, mode, _, _, clamp, scale, offset] = *regs;
+    // POLY_MODE: wireframe is not seen in the pack.
+    if mode >> 3 & 3 != 0 {
+        return;
+    }
+    let cull = match mode & 3 {
+        0 => 1,
+        1 => 2,
+        2 => 3,
+        _ => return,
+    };
+    let ccw = u8::from(mode >> 2 & 1 == 0);
+    let depth_clip = u8::from(clip >> 26 & 3 == 0);
+    let bias = f32::from_bits(offset);
+    if bias.fract() != 0.0 || !(-128.0..=127.0).contains(&bias) {
+        return;
+    }
+    let mut b = [0u8; RASTER];
+    b[..4].copy_from_slice(&[3, cull, ccw, bias as i8 as u8]);
+    b[4..8].copy_from_slice(&clamp.to_le_bytes());
+    b[8..12].copy_from_slice(&(f32::from_bits(scale) / 16.0).to_le_bytes());
+    b[12] = depth_clip;
+    for tail in 0..16u8 {
+        // The unused byte, multisample, line modes.
+        b[13..].copy_from_slice(&[tail & 1 ^ 1, tail >> 1 & 1, tail >> 2]);
+        f(b);
+    }
+}
+
 /// Hardware compare functions to D3D12's.
 fn func(v: u32) -> u8 {
     (v & 7) as u8 + 1
@@ -250,28 +308,68 @@ fn stencil_op(v: u32) -> u8 {
     }
 }
 
+/// The depth-stencil states the registers encode, and what they do not
+/// keep: b14 and the depth-bounds test (b15), the write mask of a stencil
+/// that can write nothing (kept as 0), and the ops and funcs of a stencil
+/// that is off (kept as given, the engine's descriptions still name them).
 fn depth_from_registers(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
+    let [control, stencil, ..] = *regs;
+    let (front, back) = stencil_faces(control, stencil);
+    depth_kept(regs, |b| {
+        let mut faces = vec![(b[6..10].to_vec(), b[10..14].to_vec())];
+        if b[3] == 0 {
+            faces.push((front.to_vec(), back.to_vec()));
+        }
+        let mut writes = vec![b[5]];
+        if b[3] == 1 && b[5] == 0 {
+            writes.extend([0xFF, b[4]]);
+        }
+        for (fr, bk) in &faces {
+            for &w in &writes {
+                for tail in 0..4u8 {
+                    let mut c = b;
+                    c[5] = w;
+                    c[6..10].copy_from_slice(fr);
+                    c[10..14].copy_from_slice(bk);
+                    c[14] = tail & 1;
+                    c[15] = tail >> 1;
+                    f(c);
+                }
+            }
+        }
+    });
+}
+
+/// The stencil faces `DB_DEPTH_CONTROL` and `DB_STENCIL_CONTROL` hold: the
+/// back face its own only with back-face stencil on.
+fn stencil_faces(control: u32, stencil: u32) -> ([u8; 4], [u8; 4]) {
+    let front = [
+        stencil_op(stencil),
+        stencil_op(stencil >> 8),
+        stencil_op(stencil >> 4),
+        func(control >> 8),
+    ];
+    let back = if control >> 7 & 1 != 0 {
+        [
+            stencil_op(stencil >> 12),
+            stencil_op(stencil >> 20),
+            stencil_op(stencil >> 16),
+            func(control >> 20),
+        ]
+    } else {
+        front
+    };
+    (front, back)
+}
+
+/// The depth-stencil states as the registers keep them.
+fn depth_kept(regs: &[u32; 14], mut f: impl FnMut([u8; DEPTH])) {
     let [control, stencil, mask, ..] = *regs;
     let stencil_on = (control & 1) as u8;
     let depth_on = control >> 1 & 1 != 0;
     let off = [1, 1, 1, 8];
     let (front, back, masks) = if stencil_on != 0 {
-        let front = [
-            stencil_op(stencil),
-            stencil_op(stencil >> 8),
-            stencil_op(stencil >> 4),
-            func(control >> 8),
-        ];
-        let back = if control >> 7 & 1 != 0 {
-            [
-                stencil_op(stencil >> 12),
-                stencil_op(stencil >> 20),
-                stencil_op(stencil >> 16),
-                func(control >> 20),
-            ]
-        } else {
-            front
-        };
+        let (front, back) = stencil_faces(control, stencil);
         (front, back, (mask >> 8 & 0xFF, mask >> 16 & 0xFF))
     } else {
         (off, off, (0xFF, 0xFF))
@@ -729,6 +827,79 @@ mod tests {
     }
 
     #[test]
+    fn a_rasteriser_reads_from_its_registers() {
+        // Back faces culled, clockwise front, both z clips off; clamp 0.01,
+        // slope scale 24 (a slope bias of 1.5), bias 2.
+        let regs = [
+            0x0c08_0000,
+            0x0020_1a46,
+            0,
+            0,
+            0.01f32.to_bits(),
+            24.0f32.to_bits(),
+            2.0f32.to_bits(),
+        ];
+        let mut all = Vec::new();
+        raster_from_registers(&regs, |b| all.push(b));
+        let mut want = [3, 3, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        want[4..8].copy_from_slice(&0.01f32.to_le_bytes());
+        want[8..12].copy_from_slice(&1.5f32.to_le_bytes());
+        assert_eq!(all[0], want);
+        assert_eq!(all.len(), 16, "the unused byte, multisample and line modes");
+        assert!(all.iter().all(|b| b[..13] == want[..13]));
+        // Front faces culled, counter-clockwise, depth clip on.
+        all.clear();
+        raster_from_registers(&[0x0008_0000, 0x0020_1a41, 0, 0, 0, 0, 0], |b| all.push(b));
+        assert_eq!(all[0][..4], [3, 2, 1, 0]);
+        assert_eq!(all[0][12], 1);
+        // Both faces culled, wireframe, or a fractional bias: nothing.
+        for (mode, offset) in [
+            (0x0020_1a43, 0.0f32),
+            (0x0020_1a48, 0.0),
+            (0x0020_1a40, 0.5),
+        ] {
+            raster_from_registers(&[0, mode, 0, 0, 0, 0, offset.to_bits()], |_| {
+                panic!("{mode:#x} {offset}")
+            });
+        }
+    }
+
+    #[test]
+    fn a_record_names_its_rasteriser_from_the_register_image() {
+        // A vertex-shader image (dword 1 = 4): the rasteriser registers 0x28
+        // bytes into the fixed part at 0x74.
+        let mut packet = vec![0u8; 0x74 + 0x44 + 4 * 14];
+        packet[4] = 4;
+        let regs = [
+            0u32,
+            0x0020_1a42,
+            0,
+            0,
+            0,
+            32.0f32.to_bits(),
+            3.0f32.to_bits(),
+        ];
+        for (i, r) in regs.iter().enumerate() {
+            let at = 0x74 + 0x28 + 4 * i;
+            packet[at..at + 4].copy_from_slice(&r.to_le_bytes());
+        }
+        assert_eq!(raster_registers(&packet), Some(regs));
+        assert_eq!(raster_registers(&packet[..0x74 + 0x40]), None);
+        let mut b = [3, 3, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0];
+        b[8..12].copy_from_slice(&2.0f32.to_le_bytes());
+        let hash = city64(&b);
+        let mut named = Named::default();
+        let mut want = Wanted {
+            depth: HashSet::new(),
+            raster: HashSet::from([hash]),
+            blend: HashSet::new(),
+        };
+        raster_from_registers(&regs, |c| named.try_raster(&mut want, &c));
+        assert_eq!(named.raster.get(&hash), Some(&b));
+        assert!(want.raster.is_empty());
+    }
+
+    #[test]
     fn blend_targets_get_no_logic_op() {
         let mut c = [0u8; BLEND];
         c[..2].copy_from_slice(&[1, 0]);
@@ -740,6 +911,36 @@ mod tests {
         assert_eq!(target, [1, 0, 5, 6, 1, 2, 1, 1, 4]);
         assert_eq!(d[8 + 36], 7);
         assert_eq!(w(48 + 32), 4, "second target's logic op");
+    }
+
+    #[test]
+    fn depth_states_try_what_the_registers_do_not_keep() {
+        // Depth on, always, no writes; stencil off, but its control still
+        // holds replace on pass and func equal (2 -> 3) on both faces.
+        let mut regs = [0u32; 14];
+        regs[0] = 0x0000_0272;
+        regs[1] = 0x0000_0030;
+        regs[2] = 0x0100_ff00;
+        let mut all = Vec::new();
+        depth_from_registers(&regs, |b| all.push(b));
+        let faces = [1, 1, 3, 3];
+        assert!(
+            all.iter()
+                .any(|b| b[..4] == [1, 0, 8, 0] && b[6..10] == faces && b[10..14] == faces)
+        );
+        assert!(
+            all.iter().any(|b| b[..4] == [1, 0, 8, 0] && b[15] == 1),
+            "depth bounds"
+        );
+        assert!(all.iter().any(|b| b[14] == 1));
+        // Stencil on, keep everywhere: the register's write mask 0 may be
+        // the description's 0xFF.
+        regs[0] = 0x0000_0273;
+        regs[1] = 0;
+        all.clear();
+        depth_from_registers(&regs, |b| all.push(b));
+        assert!(all.iter().any(|b| b[3] == 1 && b[4..6] == [0xFF, 0]));
+        assert!(all.iter().any(|b| b[3] == 1 && b[4..6] == [0xFF, 0xFF]));
     }
 
     #[test]
