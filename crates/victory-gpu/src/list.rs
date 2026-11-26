@@ -652,6 +652,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::texture::incompatible_copy(crate::resource::packed_format(src), crate::resource::packed_format(dst)) {
+                return;
+            }
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
@@ -718,6 +721,7 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
+        let packed = crate::resource::packed_format(dst.resource);
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -729,24 +733,43 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some(footprint) = host_footprint(src.footprint, packed) else { return };
+            let Some(host_bytes) = footprint.bytes() else { return };
+            let Some((buffer, staging)) = list.upload(host, host_bytes) else {
                 return;
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            if let Some(format) = packed {
+                let (data, staging) = (data as usize, staging as usize);
+                list.defer_host(move || {
+                    let mut guest = vec![0; bytes as usize];
+                    crate::host::copy_mapped(guest.as_mut_ptr(), data as *const u8, guest.len(), false);
+                    // SAFETY: the mapped upload spans the expanded footprint.
+                    let rgba = unsafe { std::slice::from_raw_parts_mut(staging as *mut u8, host_bytes as usize) };
+                    let row = footprint.width as usize * 2;
+                    for (src, dst) in guest.chunks(src.footprint.row_pitch as usize).zip(rgba.chunks_mut(footprint.row_pitch as usize)) {
+                        crate::texture::expand_row(format, &src[..row], dst);
+                    }
+                });
+            } else {
+                list.defer_fill(staging, data, bytes as usize);
+            }
+            from.footprint = footprint;
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, host_bytes));
             }
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::texture::incompatible_copy(crate::resource::packed_format(src.resource), packed) {
+                return;
+            }
             if crate::texture::title_written(&texture) {
                 crate::texture::upload(list, src.resource, &texture);
             }
@@ -797,6 +820,22 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Doubling a packed pitch preserves its alignment and doubles every texel offset.
+#[cfg(windows)]
+fn host_footprint(mut f: crate::resource::PlacedFootprint, packed: Option<u32>) -> Option<crate::resource::PlacedFootprint> {
+    f.offset = 0;
+    if packed.is_some() {
+        if crate::resource::element(f.format) != Some((2, 1)) || f.width == 0 || f.height == 0 || f.depth == 0
+            || f.width.checked_mul(2)? > f.row_pitch || !f.row_pitch.is_multiple_of(256)
+        {
+            return None;
+        }
+        f.format = 28;
+        f.row_pitch = f.row_pitch.checked_mul(2)?;
+    }
+    Some(f)
 }
 
 /// Texture read backs since the last frame-rate line: how many, bytes
@@ -853,7 +892,12 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (Some(rows), Some(len)) = (dst.footprint.rows(at, size), dst.footprint.bytes()) else {
         refused!("a region outside its footprint");
     };
-    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
+    let packed = crate::resource::packed_format(src.resource);
+    let Some(footprint) = host_footprint(dst.footprint, packed) else {
+        refused!("invalid packed footprint");
+    };
+    let Some(host_bytes) = footprint.bytes() else { return };
+    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, host_bytes)) else {
         return;
     };
     if crate::texture::title_written(&texture) {
@@ -862,7 +906,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     ensure_state(list, src.resource, COPY_SOURCE);
     let (mut to, mut from) = (*dst, *src);
     to.resource = buffer.as_raw().cast_const().cast();
-    to.footprint.offset = 0;
+    to.footprint = footprint;
     from.resource = texture.as_raw().cast_const().cast();
     #[cfg(feature = "diagnostics")]
     {
@@ -903,10 +947,20 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     };
     let (data, title) = (data as usize, title as usize);
     list.defer_after(move || {
+        let mut row = Vec::new();
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);
             let _writing = crate::watch::writing(title + at, n);
-            crate::host::write_mapped((title + at) as *mut u8, (data + at) as *const u8, n);
+            let src = if let Some(format) = packed {
+                // SAFETY: the same region in the expanded footprint has twice the offset and length.
+                let rgba = unsafe { std::slice::from_raw_parts((data + at * 2) as *const u8, n * 2) };
+                row.resize(n, 0);
+                crate::texture::pack_row(format, rgba, &mut row);
+                row.as_ptr()
+            } else {
+                (data + at) as *const u8
+            };
+            crate::host::write_mapped((title + at) as *mut u8, src, n);
         }
     });
 }
@@ -946,6 +1000,10 @@ extern "system" fn resolve(
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
+        let packed = crate::resource::packed_format(dst);
+        if crate::texture::incompatible_copy(crate::resource::packed_format(src), packed) {
+            return;
+        }
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
@@ -956,7 +1014,7 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
+            let format = if packed.is_some() { a.Format } else { DXGI_FORMAT(format as i32) };
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(&to, dst_sub, &from, src_sub, format);
@@ -1862,6 +1920,9 @@ pub(crate) fn has_newer_table(list: This) -> bool {
     let table = unsafe { *list.cast::<*const *const ()>() };
     table == NEWER_LIST_FUNCTIONS.0.as_ptr()
 }
+
+#[cfg(all(test, windows))]
+mod packed_copy_tests;
 
 #[cfg(test)]
 mod tests {

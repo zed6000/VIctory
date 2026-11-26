@@ -153,10 +153,11 @@ impl Viewed {
 fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
-    if let View::Shader(resource, _) = view
+    if let View::Shader(resource, _) | View::Unordered(resource, ..) = view
         && let Some(texture) = crate::resource::made_copy(*resource as This)
+        && (texture.packed().is_some() || matches!(view, View::Shader(..)) && crate::texture::title_written(&texture.texture))
     {
-        return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource));
+        return Some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {

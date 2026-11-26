@@ -33,6 +33,41 @@ macro_rules! once {
     }};
 }
 
+/// shortcut: GPU copies between different packed layouts need a conversion pass.
+pub(crate) fn incompatible_copy(src: Option<u32>, dst: Option<u32>) -> bool {
+    if src == dst {
+        return false;
+    }
+    once!(?src, ?dst, "GPU texture copy or resolve skipped: packed stand-in layouts differ");
+    true
+}
+
+/// Converts one row from the title's little-endian BGRA bits to host RGBA8.
+pub(crate) fn expand_row(format: u32, packed: &[u8], rgba: &mut [u8]) {
+    for (p, c) in packed.as_chunks::<2>().0.iter().zip(rgba.as_chunks_mut::<4>().0.iter_mut()) {
+        let bits = u16::from_le_bytes(*p);
+        let channel = |shift: u32, max: u16| (((bits >> shift & max) * 255 + max / 2) / max) as u8;
+        let color = match format {
+            86 => [channel(10, 31), channel(5, 31), channel(0, 31), channel(15, 1)],
+            115 => [channel(8, 15), channel(4, 15), channel(0, 15), channel(12, 15)],
+            _ => unreachable!(),
+        };
+        *c = color;
+    }
+}
+
+pub(crate) fn pack_row(format: u32, rgba: &[u8], packed: &mut [u8]) {
+    for (c, p) in rgba.as_chunks::<4>().0.iter().zip(packed.as_chunks_mut::<2>().0.iter_mut()) {
+        let channel = |i: usize, max: u16| (u16::from(c[i]) * max + 127) / 255;
+        let bits = match format {
+            86 => channel(3, 1) << 15 | channel(0, 31) << 10 | channel(1, 31) << 5 | channel(2, 31),
+            115 => channel(3, 15) << 12 | channel(0, 15) << 8 | channel(1, 15) << 4 | channel(2, 15),
+            _ => unreachable!(),
+        };
+        *p = bits.to_le_bytes();
+    }
+}
+
 /// A texture's upload state: how a staging buffer lays out the host
 /// texture's subresources, and what was last detiled. The buffer itself is
 /// taken for each upload from a small pool shared by all textures
@@ -42,6 +77,7 @@ macro_rules! once {
 pub(crate) struct Staging {
     /// A staging buffer's bytes.
     size: u64,
+    packed: Option<u32>,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -260,6 +296,9 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     ) else {
         return;
     };
+    if incompatible_copy(crate::resource::packed_format(from), crate::resource::packed_format(to)) {
+        return;
+    }
     // An odd key: textures' own first uses are keyed by the host texture.
     if !list.first_use(to as usize | 1) {
         return;
@@ -535,7 +574,9 @@ impl Staging {
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
-        self.tracked.as_ref().is_none_or(|t| !t.clean())
+        // After initialization a writable stand-in keeps the GPU's contents.
+        (self.packed.is_none() || self.uploads.load(std::sync::atomic::Ordering::Relaxed) == 0)
+            && self.tracked.as_ref().is_none_or(|t| !t.clean())
     }
 
     /// A staging buffer with the texture memory detiled into it if it
@@ -693,10 +734,19 @@ impl Staging {
             // keeping the slice strictly inside the mapped staging buffer even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            let detile = |dst: &mut [u8], pitch| self.layout.detile(tiled, mip, slice, dst, pitch, pitch * rows as usize);
+            let result = if let Some(format) = self.packed {
+                let row = f.Width as usize * 2;
+                let mut packed = vec![0; row * rows as usize * f.Depth as usize];
+                detile(&mut packed, row).map(|()| {
+                    for (src, dst) in packed.chunks_exact(row).zip(linear.chunks_mut(pitch)) {
+                        expand_row(format, src, dst);
+                    }
+                })
+            } else {
+                detile(linear, pitch)
+            };
+            if let Err(e) = result {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return None;
             }
@@ -826,6 +876,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     let spans = spans(&layout, count, u32::from(d.MipLevels));
     let s = Arc::new(Staging {
         size: total,
+        packed: copy.packed(),
         footprints,
         rows,
         layout,
@@ -844,6 +895,29 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_colors_round_trip_with_their_alpha() {
+        for (format, word, expected) in [
+            (86, 0x8443u16, [8, 16, 25, 255]),
+            (115, 0xa123, [17, 34, 51, 170]),
+        ] {
+            let mut rgba = [0; 4];
+            let mut packed = [0; 2];
+            expand_row(format, &word.to_le_bytes(), &mut rgba);
+            assert_eq!(rgba, expected);
+            for word in 0..=u16::MAX {
+                expand_row(format, &word.to_le_bytes(), &mut rgba);
+                pack_row(format, &rgba, &mut packed);
+                assert_eq!(u16::from_le_bytes(packed), word);
+            }
+        }
+        for (alpha, high) in [(127, 0), (128, 0x80)] {
+            let mut packed = [0; 2];
+            pack_row(86, &[0, 0, 0, alpha], &mut packed);
+            assert_eq!(packed, [0, high]);
+        }
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

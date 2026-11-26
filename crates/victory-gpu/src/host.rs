@@ -1820,6 +1820,9 @@ impl HostList {
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
         let texture = copy.texture.clone();
+        if copy.packed().is_some() {
+            crate::texture::upload(self, resource, &texture);
+        }
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)
         {
