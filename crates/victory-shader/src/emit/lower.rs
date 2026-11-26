@@ -23,6 +23,7 @@ use crate::resource::{Address, CODE, GS_TABLE, MEMORY, Resources, Role, Site, So
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod phi;
 mod sum64;
 
 type Why = &'static str;
@@ -75,6 +76,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// `dx.op.waveActiveBallot` calls emitted into the module.
+    #[cfg(test)]
+    pub wave_ballots: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -733,30 +737,7 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
-            }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
-                    LaneExit::Branch { when, .. } => Some(when),
-                    _ => None,
-                });
-                let mut all: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
-                all.sort_unstable();
-                all.dedup();
-                all.into_iter().any(|g| {
-                    x.st.bools
-                        .support(g)
-                        .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
-                })
-            };
+            }) || phi::mask_uses_console_lanes(p, x.st, &phi_at);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -1599,6 +1580,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            wave_ballots: self.s.m.written_calls("dx.op.waveActiveBallot") as u32,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -8576,7 +8559,13 @@ impl<'a> Lower<'a> {
                         .iter()
                         .filter(|ph| atoms.contains(&Atom::Phi(ph.value)))
                         .filter_map(|ph| {
-                            Some((*st.masks.get(&ph.value)?, *st.masks.get(&ph.args[n])?))
+                            let joined = *st.masks.get(&ph.value)?;
+                            let incoming = st
+                                .phi_masks
+                                .get(&ph.value)
+                                .and_then(|v| v.get(n).copied())
+                                .or_else(|| st.masks.get(&ph.args[n]).copied())?;
+                            Some((joined, incoming))
                         })
                         .collect();
                     (all, to, links)
@@ -11208,96 +11197,6 @@ impl<'a> Lower<'a> {
         let limit = scalar_constant(bound)?;
         // The initial index is below this slot. The loop must pass it before exit.
         (slot < limit).then_some(())
-    }
-
-    fn fill_phis(&mut self) -> Result<(), Stop> {
-        let p = self.x.p;
-        let live = self.live_edges();
-        for (v, b, i) in std::mem::take(&mut self.data_phis) {
-            let phi = &p.blocks[b].phis[i];
-            let bit = phi.reg == Reg::Scc;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let arg = phi.args[n];
-                let read = live.contains(&(phi.value, n));
-                let x = match (self.vals.get(&arg).copied(), bit) {
-                    (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    // No lane from this edge reads it, or no lane comes
-                    // along it at all: any value will do.
-                    _ if read
-                        && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) =>
-                    {
-                        if bit {
-                            self.s.m.bool(false)
-                        } else {
-                            self.s.m.i32(0)
-                        }
-                    }
-                    // An input an unguarded counted `v_movreld` loop overwrites
-                    // before anything reads it (PR #457).
-                    (Some(Val::Missing("barycentrics read directly")), false)
-                        if read && self.overwritten_movreld_edge(b, phi, n).is_some() =>
-                    {
-                        self.s.m.undef(self.s.t.i32)
-                    }
-                    (Some(Val::Bit(_)), false) if read => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
-                    }
-                    // A lane mask joined with data at a join every lane
-                    // enters along one edge: the register holds the mask's
-                    // number there (console lanes, so exact).
-                    _ if read
-                        && !bit
-                        && self.mask_data == MaskData::Console
-                        && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg))
-                        && self.uniform_join(b) =>
-                    {
-                        self.mask_dword(arg).map_err(|w| Stop::Retry(phi.value, w))?
-                    }
-                    (Some(Val::Missing(why)), _) if read => {
-                        return Err(Stop::Retry(phi.value, why));
-                    }
-                    _ if read => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
-                    }
-                    _ if bit => self.s.m.bool(false),
-                    _ => self.s.m.i32(0),
-                };
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
-        }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
-            self.s.m.set_phi(phi, incoming);
-        }
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
-            let offset = p.blocks[b].offset;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let arg = phi.args[n];
-                const UNTRACKED: Why = "a lane-mask join of an untracked mask";
-                // Data joined with masks where the wave takes one edge (the BVH
-                // walks pop masks from memory): with console lanes the lane's
-                // own bit of the number, as `Atom::Opaque`.
-                let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
-                let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
-                    (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
-                    (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
-                    (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
-                        self.s.m.bool(false)
-                    }
-                    (None, _) => return Err(unsupported(offset, UNTRACKED)),
-                };
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
-        }
-        Ok(())
     }
 }
 

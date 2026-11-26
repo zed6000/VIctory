@@ -2440,3 +2440,320 @@ fn a_64_bit_inline_constant_source_is_the_same_value() {
         assert_eq!(got, 1.0f32.to_bits(), "{backend}: case {i}");
     });
 }
+
+fn build_wave32_cs(body: &[u32]) -> HostShader {
+    let mut words = Vec::new();
+    // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
+    words.push(s_mov_b32(5, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(body);
+    // v2 = v0 * 4 (per-lane byte offset into the UAV), store v1 at out[v0].
+    words.push((0x01A << 25) | (2 << 17) | 0x82); // v_lshlrev_b32 v2, 2, v0
+    words.extend_from_slice(&[
+        0x38 << 26 | 0x1C << 18 | (1 << 12), // buffer_store_dword ... offen
+        0x80 << 24 | ((8 >> 2) << 16) | (1 << 8) | 2,
+    ]);
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        view_marks: lowered.view_marks,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+fn dispatch_wave32(
+    name: &str,
+    shader: &HostShader,
+    fixed_wave: bool,
+    cases: &[([u32; 4], Vec<u32>)],
+) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("{name}: no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        ran += 1;
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(p) => p,
+            // WARP does not accept every fixed WaveSize requirement.
+            Err(e)
+                if (warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1"))
+                    && fixed_wave =>
+            {
+                eprintln!("{name}: skipped on {label} ({e})");
+                continue;
+            }
+            Err(e) => panic!("{name} ({label}): compute_pipeline failed: {e}"),
+        };
+        for (i, (inputs, want)) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{name} ({label}): dispatch failed: {e}"));
+            assert_eq!(&out[0], want, "{name} ({label}): case {i} ({inputs:?})");
+        }
+    }
+    assert!(
+        ran > 0,
+        "{name}: neither hardware nor WARP SM 6.6 device available"
+    );
+}
+
+#[test]
+fn lane_mask_phi_joins_execute_correctly() {
+    // Branch join: s0 == 0 sets s2 = 0; otherwise s2 = (v0 < s1).
+    let branch = build_wave32_cs(&[
+        0xBF06_8000, // 0: s_cmp_eq_u32 s0, 0
+        0xBF84_0002, // 4: s_cbranch_scc0 -> 16 (otherwise s2 = (v0 < s1))
+        0xBE82_0380, // 8: s_mov_b32 s2, 0
+        0xBF82_0002, // 12: s_branch -> 24
+        0xD4C4_0002,
+        u32::from(sgpr(1)) | (u32::from(vgpr(0)) << 9), // 16: v_cmp_gt_u32 s2, s1, v0 (v0 < s1)
+        0xD501_0001,
+        (0x8A) | (0x94 << 9) | (2 << 18), // 24: v_cndmask_b32 v1, 10, 20, s2
+    ]);
+    dispatch_wave32(
+        "branch_zero_join",
+        &branch,
+        false,
+        &[
+            ([0, 16, 0, 0], vec![10; 32]),
+            (
+                [1, 16, 0, 0],
+                (0..32).map(|t| if t < 16 { 20 } else { 10 }).collect(),
+            ),
+        ],
+    );
+
+    // Branch join with a partial constant mask: s0 == 0 sets s2 = 0xF; otherwise s2 = (v0 < s1).
+    let partial_constant = build_wave32_cs(&[
+        0xBF06_8000, // 0: s_cmp_eq_u32 s0, 0
+        0xBF84_0002, // 4: s_cbranch_scc0 -> 16 (otherwise s2 = (v0 < s1))
+        0xBE82_038F, // 8: s_mov_b32 s2, 15
+        0xBF82_0002, // 12: s_branch -> 24
+        0xD4C4_0002,
+        u32::from(sgpr(1)) | (u32::from(vgpr(0)) << 9), // 16: v_cmp_gt_u32 s2, s1, v0 (v0 < s1)
+        0xD501_0001,
+        (0x8A) | (0x94 << 9) | (2 << 18), // 24: v_cndmask_b32 v1, 10, 20, s2
+    ]);
+    dispatch_wave32(
+        "partial_constant_join",
+        &partial_constant,
+        true,
+        &[
+            (
+                [0, 16, 0, 0],
+                (0..32).map(|t| if t < 4 { 20 } else { 10 }).collect(),
+            ),
+            (
+                [1, 16, 0, 0],
+                (0..32).map(|t| if t < 16 { 20 } else { 10 }).collect(),
+            ),
+        ],
+    );
+
+    // Loop accumulator from 0: iterates i = 0..s0, reading phi s2 inside the
+    // loop, accumulating `s2 |= (v0 == i)`, then reading final s2 after exit.
+    // v1 = (inside last iter: 20 if v0 < s0 - 1 else 10) + (after loop: 30 if v0 < s0 else 10).
+    let loop_shader = build_wave32_cs(&[
+        0xBE82_0380, // 0: s_mov_b32 s2, 0
+        0xBE86_0380, // 4: s_mov_b32 s6, 0
+        0xD501_0001,
+        (0x8A) | (0x94 << 9) | (2 << 18), // 8: v_cndmask_b32 v1, 10, 20, s2
+        0x7D84_0006,                      // 16: v_cmp_eq_u32 vcc, s6, v0
+        0x8802_026A,                      // 20: s_or_b32 s2, vcc_lo, s2
+        0x8006_8106,                      // 24: s_add_u32 s6, s6, 1
+        0xBF0A_0006,                      // 28: s_cmp_lt_u32 s6, s0
+        0xBF85_FFF9,                      // 32: s_cbranch_scc1 -> 8
+        0xD501_0003,
+        (0x8A) | (0x9E << 9) | (2 << 18), // 36: v_cndmask_b32 v3, 10, 30, s2
+        (0x025 << 25) | (1 << 17) | (3 << 9) | 257, // 44: v_add_nc_u32 v1, v1, v3
+    ]);
+    dispatch_wave32(
+        "loop_accumulator",
+        &loop_shader,
+        false,
+        &[(
+            [5, 0, 0, 0],
+            (0..32)
+                .map(|t| {
+                    if t < 4 {
+                        50
+                    } else if t == 4 {
+                        40
+                    } else {
+                        20
+                    }
+                })
+                .collect(),
+        )],
+    );
+}
+
+#[test]
+fn lane_mask_phi_whole_read_and_readlane_execute_correctly() {
+    let pack_whole_and_lanes = |body: &mut Vec<u32>| {
+        // s6 = s2 & exec_lo (whole joined mask as a 32-bit integer)
+        body.push(sop2(0x0E, 6, 2, 0x7E));
+        // v2 = s2 ? 1 : 0; s12 = lane 0 of v2; s13 = lane 31 of v2
+        body.extend_from_slice(&vop3(0x101, 2, 0x80, 0x81, sgpr(2)));
+        body.extend_from_slice(&vop3(0x360, 12, vgpr(2), 0x80, 0));
+        body.extend_from_slice(&vop3(0x360, 13, vgpr(2), 0x9F, 0));
+        // out[t] = (t == 1) ? s12 : (t == 2) ? s13 : s6
+        body.push(vop1(0x01, 1, sgpr(6)));
+        body.push(vop1(0x01, 3, sgpr(12)));
+        body.push(0x7D84_0081); // v_cmp_eq_u32 vcc_lo, 1, v0
+        body.extend_from_slice(&vop3(0x101, 1, vgpr(1), vgpr(3), sgpr(0x6A)));
+        body.push(vop1(0x01, 3, sgpr(13)));
+        body.push(0x7D84_0082); // v_cmp_eq_u32 vcc_lo, 2, v0
+        body.extend_from_slice(&vop3(0x101, 1, vgpr(1), vgpr(3), sgpr(0x6A)));
+    };
+    let expected = |mask: u32| -> Vec<u32> {
+        let mut out = vec![mask; 32];
+        out[1] = mask & 1;
+        out[2] = (mask >> 31) & 1;
+        out
+    };
+
+    // 1. Per-lane join where given(m, e) == Bool::TRUE inside the taken arm
+    // (`s2 = vcc_lo` under `v0 < s0`), then read as a whole mask and via `v_readlane_b32`.
+    let mut vcc_words = vec![
+        0x7D88_0000,            // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
+        s_mov_b32(2, 0x80),     // s2 = 0
+        0xBE87_3C6A,            // s_and_saveexec_b32 s7, vcc_lo
+        0xBF88_0001,            // s_cbranch_execz +1
+        s_mov_b32(2, 0x6A),     // s2 = vcc_lo
+        s_mov_b32(0x7E, 7),     // exec_lo = s7
+    ];
+    pack_whole_and_lanes(&mut vcc_words);
+    let vcc_shader = build_wave32_cs(&vcc_words);
+    let mask_of = |n: u32| u32::try_from(1u64.checked_shl(n).map_or(0u64, |v| v - 1)).unwrap_or(u32::MAX);
+    let vcc_cases: Vec<([u32; 4], Vec<u32>)> = [0, 1, 7, 16, 31, 32]
+        .into_iter()
+        .map(|n| {
+            let m = if n >= 32 { u32::MAX } else { mask_of(n) };
+            ([n, 0, 0, 0], expected(m))
+        })
+        .collect();
+    dispatch_wave32("per_lane_vcc_whole_mask_and_readlane", &vcc_shader, true, &vcc_cases);
+
+    // 2. Per-lane join assigning a distinct sub-mask (`v0 < s1`) under `v0 < s0`.
+    let mut sub_words = vec![
+        0x7D88_0000,                            // v_cmp_gt_u32 vcc_lo, s0, v0 (v0 < s0)
+        s_mov_b32(2, 0x80),                     // s2 = 0
+        0xBE87_3C6A,                            // s_and_saveexec_b32 s7, vcc_lo
+        0xBF88_0002,                            // s_cbranch_execz +2
+        0xD4C4_0002,                            // v_cmp_gt_u32 s2, s1, v0 (v0 < s1)
+        u32::from(sgpr(1)) | (u32::from(vgpr(0)) << 9),
+        s_mov_b32(0x7E, 7),                     // exec_lo = s7
+    ];
+    pack_whole_and_lanes(&mut sub_words);
+    let sub_shader = build_wave32_cs(&sub_words);
+    let sub_cases: Vec<([u32; 4], Vec<u32>)> = [(0, 16), (16, 0), (16, 8), (8, 24), (32, 1), (32, 32)]
+        .into_iter()
+        .map(|(a, b)| {
+            let k = a.min(b);
+            let m = if k >= 32 { u32::MAX } else { mask_of(k) };
+            ([a, b, 0, 0], expected(m))
+        })
+        .collect();
+    dispatch_wave32("per_lane_submask_whole_mask_and_readlane", &sub_shader, true, &sub_cases);
+}
