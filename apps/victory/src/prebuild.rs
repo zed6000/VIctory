@@ -116,11 +116,22 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
                 return Ok(Prebuild::compute(&cs));
             }
         };
-        let [ps, vs, gs, ..] = g.stages;
-        if g.stages[3..].iter().any(Option::is_some) {
-            return Err("stages other than vertex, mesh and pixel".into());
+        let [ps, vs, gs, es, ..] = g.stages;
+        if g.stages[4..].iter().any(Option::is_some) {
+            return Err("stages other than vertex, geometry, mesh and pixel".into());
         }
-        let (first, stage) = vs
+        // A merged geometry stage: the vertex shader is the export stage's
+        // program, the geometry shader the geometry stage's.
+        let geometry = match es {
+            Some(_) => match gs.and_then(|s| container(s.program)) {
+                Some((c, HwStage::Gs)) => Some(c),
+                Some(_) => return Err("an export stage without a geometry shader".into()),
+                None => return Err("shader not found".into()),
+            },
+            None => None,
+        };
+        let (first, stage) = es
+            .or(vs)
             .or(gs)
             .and_then(|s| container(s.program))
             .ok_or("shader not found")?;
@@ -131,6 +142,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         let mesh = match stage {
             HwStage::Ms => true,
             HwStage::Vs => false,
+            HwStage::Es if geometry.is_some() => false,
             _ => return Err("first stage not a vertex or mesh shader".into()),
         };
         let stream = pipelines::stream(g, &named, &first, mesh, pixel.as_deref()).map_err(|u| {
@@ -142,8 +154,12 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             }
             .to_owned()
         })?;
-        // SAFETY: the stream points at `first`, `pixel` and its own input
-        // elements, all alive here.
+        let stream = match &geometry {
+            Some(gs) => stream.with_geometry(gs),
+            None => stream,
+        };
+        // SAFETY: the stream points at `first`, `pixel`, `geometry` and its
+        // own input elements, all alive here.
         Ok(unsafe { Prebuild::graphics(stream.bytes()) })
     };
 
@@ -152,13 +168,14 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         let stages: Vec<(&str, &[u8])> = match job {
             Job::Compute(i) => vec![("compute", compute[i].stage.program)],
             Job::Graphics(i) => {
-                let [ps, vs, gs, ..] = graphics[i].stages;
-                let first = vs
+                let [ps, vs, gs, es, ..] = graphics[i].stages;
+                let first = (es.or(vs))
                     .map(|s| ("vertex", s.program))
                     .or(gs.map(|s| ("mesh", s.program)));
                 first
                     .into_iter()
                     .chain(ps.map(|s| ("pixel", s.program)))
+                    .chain(es.and(gs).map(|s| ("geometry", s.program)))
                     .collect()
             }
         };

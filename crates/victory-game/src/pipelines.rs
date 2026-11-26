@@ -566,6 +566,15 @@ impl Stream<'_> {
     }
 }
 
+impl<'a> Stream<'a> {
+    /// The stream with the geometry shader container `gs` in its slot.
+    pub fn with_geometry(mut self, gs: &'a [u8]) -> Self {
+        self.bytes[0x78..0x80].copy_from_slice(&(gs.as_ptr() as u64).to_le_bytes());
+        self.bytes[0x80..0x88].copy_from_slice(&(gs.len() as u64).to_le_bytes());
+        self
+    }
+}
+
 /// The stream the engine builds for record `g` with the given shader
 /// containers (`first` a mesh shader if `mesh`).
 pub fn stream<'a>(
@@ -827,6 +836,13 @@ mod tests {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(words, [1, 28, 1, 12, 1, 1]);
+        // A geometry shader goes in its own slot (type 5).
+        let s = stream(&g, &named, &vs, false, None)
+            .unwrap()
+            .with_geometry(&ps);
+        let b = s.bytes();
+        let q = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        assert_eq!((b[0x70], q(0x78), q(0x80)), (5, ps.as_ptr() as u64, 20));
         // A mesh shader goes in the first slot as type 24.
         let s = stream(&g, &named, &vs, true, None).unwrap();
         assert_eq!(

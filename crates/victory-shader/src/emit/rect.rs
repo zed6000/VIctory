@@ -10,7 +10,7 @@
 //! fourth corner.
 
 use super::bitcode::{Attr, Bin, Term, V, pred};
-use super::shader::Shader;
+use super::shader::{Geometry, Shader};
 use crate::ShaderError;
 use crate::dxbc::{Container, FourCC};
 
@@ -45,7 +45,7 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         e.usage = (1 << e.cols) - 1;
     }
     let mut s = Shader::new(false);
-    s.gs = Some(6);
+    s.gs = Some(Geometry::triangles(6));
     let b = s.entry;
     // Corner k's values, element by element, component by component.
     let mut corners: Vec<Vec<Vec<super::bitcode::V>>> = Vec::new();
