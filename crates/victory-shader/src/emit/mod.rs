@@ -473,6 +473,8 @@ pub fn emit_with(
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
+            // Until a read says which mode (`lower`).
+            (28, _) => 2,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
@@ -642,6 +644,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
@@ -848,35 +851,32 @@ mod tests {
             let st = structure::structure(&p).unwrap();
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res);
-            if matches!(case, Complete | NonzeroBase) {
-                let shader = shader.unwrap();
-                assert!(
-                    Container::parse(&shader.dxil)
-                        .unwrap()
-                        .part(FourCC::DXIL)
-                        .is_some()
-                );
-                #[cfg(windows)]
-                if let Ok(mut validator) =
-                    validator::Validator::load(validator::Validator::default_path().as_deref())
-                {
-                    let mut dxil = shader.dxil;
-                    validator.validate(&mut dxil).unwrap();
-                    eprintln!("synthetic {case:?} SDK valid bytes={}", dxil.len());
-                }
-            } else {
-                eprintln!("synthetic {case:?} {:?}", shader.as_ref().err());
-                assert!(
-                    matches!(
-                        shader,
-                        Err(ShaderError::Unsupported {
-                            what: "barycentrics read directly",
-                            ..
-                        })
-                    ),
-                    "{case:?}"
-                );
+            let shader = emit(&c, &native, &p, &st, &io, &res)
+                .unwrap_or_else(|e| panic!("{case:?}: {e}"));
+            let container = Container::parse(&shader.dxil).unwrap();
+            assert!(container.part(FourCC::DXIL).is_some());
+            // A complete overwrite needs no original input. Every other case
+            // must retain it; direct barycentric reads are now supported.
+            let needs_input = !matches!(case, Complete | NonzeroBase);
+            let features = u64::from_le_bytes(
+                container.part(FourCC::SFI0).unwrap().data.try_into().unwrap(),
+            );
+            assert_eq!(features & 0x2_0000 != 0, needs_input, "{case:?}");
+            let inputs = signature(container.part(FourCC::ISG1).unwrap().data).unwrap();
+            assert_eq!(
+                inputs.iter().filter(|e| e.kind == 28).count(),
+                usize::from(needs_input),
+                "{case:?}"
+            );
+            #[cfg(windows)]
+            if let Ok(mut validator) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                let mut dxil = shader.dxil;
+                validator
+                    .validate(&mut dxil)
+                    .unwrap_or_else(|e| panic!("{case:?}: {e}"));
+                eprintln!("indexed input {case:?}: validated, barycentrics={needs_input}");
             }
         }
     }
@@ -1517,8 +1517,8 @@ mod tests {
     }
 
     /// A 16-bit result written over a first interpolation half keeps that
-    /// half's high 16 bits, which have no host form: what reads only the low
-    /// half translates, a read of the whole dword does not.
+    /// half's high 16 bits. Both narrow reads and reads retaining those bits
+    /// translate once the live first half has a host value.
     #[test]
     fn a_half_over_a_first_interpolation_half_reads_as_a_half() {
         let program = |read: u32| {
@@ -1540,10 +1540,8 @@ mod tests {
         };
         program(0x7E08_1702).unwrap(); // v_cvt_f32_f16 v4, v2
         program(0x3408_0490).unwrap(); // v_lshlrev_b32 v4, 16, v2
-        let whole = program(0x7E08_0302).unwrap_err(); // v_mov_b32 v4, v2
-        assert!(whole.to_string().contains("first half"), "{whole}");
-        let part = program(0x3408_0488).unwrap_err(); // v_lshlrev_b32 v4, 8, v2
-        assert!(part.to_string().contains("first half"), "{part}");
+        program(0x7E08_0302).unwrap(); // v_mov_b32 v4, v2
+        program(0x3408_0488).unwrap(); // v_lshlrev_b32 v4, 8, v2
     }
 
     /// A pixel export before the `done` one, both under a lane guard (EXEC
@@ -1577,8 +1575,8 @@ mod tests {
 
     /// The compiler reuses the j register (`v_mov` under a kill's EXEC) and
     /// interpolates in the other lanes: those still hold j, which
-    /// structurisation's lane conditions prove. Interpolating in the lanes
-    /// the copy ran in stays refused.
+    /// structurisation's lane conditions prove. In the lanes the copy ran
+    /// in, interpolation must use the actual computed weight instead.
     #[test]
     fn an_interpolation_after_j_is_reused_in_other_lanes_translates() {
         let program = |other_lanes: &[u32]| {
@@ -1600,9 +1598,14 @@ mod tests {
             let osg1 = rows(&[("SV_Target", 16, false)], false);
             emit_pixel(&words, vec![texcoord(false)], 1 << 1 | 1 << 8, &isg1, &osg1)
         };
-        program(&[0x8A7E_7E00]).unwrap(); // s_andn2_b32 exec_lo, s0, exec_lo
-        let e = program(&[]).unwrap_err();
-        assert!(e.to_string().contains("computed barycentrics"), "{e}");
+        let safe = program(&[0x8A7E_7E00]).unwrap(); // s_andn2_b32 exec_lo, s0, exec_lo
+        let features = |s: &HostShader| {
+            let c = Container::parse(&s.dxil).unwrap();
+            u64::from_le_bytes(c.part(FourCC::SFI0).unwrap().data.try_into().unwrap())
+        };
+        assert_eq!(features(&safe) & 0x2_0000, 0);
+        let computed = program(&[]).unwrap();
+        assert_ne!(features(&computed) & 0x2_0000, 0);
     }
 
     /// Two elements sharing a row, the one at the higher channels listed
@@ -2083,5 +2086,671 @@ mod tests {
             }
             assert_eq!(batched_texels, texels, "warp {warp}, batched GS coverage");
         }
+    }
+}
+
+#[cfg(test)]
+mod barycentric_tests {
+    use super::container::SigElement;
+    use super::*;
+    use crate::native::{PsInput, StageIo, Usage};
+
+    /// `SPI_PS_INPUT_ADDR` bits: PERSP_CENTER, PERSP_CENTROID,
+    /// LINEAR_CENTER.
+    const PERSP_CENTER: u32 = 1 << 1;
+    const PERSP_CENTROID: u32 = 1 << 2;
+    const LINEAR_CENTER: u32 = 1 << 5;
+
+    /// `exp mrt0, v<r>, v<r>, v<r>, v<r> done vm`.
+    fn exp_mrt0(r: u32) -> [u32; 2] {
+        [0xF800_180F, r * 0x0101_0101]
+    }
+
+    /// VOP2 `v_add_f32 v<dst>, v<a>, v<b>`.
+    fn v_add_f32(dst: u32, a: u32, b: u32) -> u32 {
+        3 << 25 | dst << 17 | b << 9 | (256 + a)
+    }
+
+    fn element(name: &str, kind: u8, row: u32) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    /// Translates a pixel program with the input VGPRs `input_addr`
+    /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
+    fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_half(words, input_addr, false)
+    }
+
+    fn pixel_with_half(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut target = element("SV_Target", 16, 0);
+        target.usage = 15;
+        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// The translation's `SFI0` features and `ISG1` rows.
+    fn parts(shader: &HostShader) -> (u64, Vec<SigElement>) {
+        let c = Container::parse(&shader.dxil).unwrap();
+        let sfi0 = c.part(FourCC::SFI0).unwrap().data.try_into().unwrap();
+        (
+            u64::from_le_bytes(sfi0),
+            signature(c.part(FourCC::ISG1).unwrap().data).unwrap(),
+        )
+    }
+
+    fn validate(shader: &HostShader) {
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone()).unwrap();
+        }
+        let _ = shader;
+    }
+
+    /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
+    /// plain floats: they are channels y and z of `SV_Barycentrics`, the
+    /// weights of vertices 1 and 2.
+    #[test]
+    fn barycentrics_read_as_values_are_sv_barycentrics() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [v_add_f32(2, 0, 1), e0, e1, 0xBF81_0000];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
+        let bary: Vec<_> = inputs.iter().filter(|e| e.kind == 28).collect();
+        assert_eq!(bary.len(), 1, "{inputs:?}");
+        assert_eq!((bary[0].index, bary[0].col, bary[0].cols), (0, 0, 3));
+        // Not packed: the validator wants packing location -1.
+        assert_eq!(bary[0].row, None);
+        // Only y and z (I and J) are read.
+        let isg1 = Container::parse(&shader.dxil).unwrap();
+        let isg1 = isg1.part(FourCC::ISG1).unwrap().data;
+        let rw: Vec<u8> = (0..2).map(|k| isg1[8 + 32 * k + 25]).collect();
+        assert!(rw.contains(&0b110), "{rw:?}");
+        validate(&shader);
+    }
+
+    /// Two kinds of barycentrics read directly: one element per mode.
+    #[test]
+    fn two_barycentric_modes_get_two_elements() {
+        // v0-v1 perspective i, j; v2-v3 linear i, j.
+        let [e0, e1] = exp_mrt0(4);
+        let words = [v_add_f32(4, 0, 3), e0, e1, 0xBF81_0000];
+        let shader = pixel(&words, PERSP_CENTER | LINEAR_CENTER).unwrap();
+        let (_, inputs) = parts(&shader);
+        let mut indices: Vec<u32> = inputs
+            .iter()
+            .filter(|e| e.kind == 28)
+            .map(|e| e.index)
+            .collect();
+        indices.sort();
+        assert_eq!(indices, [0, 1], "{inputs:?}");
+        validate(&shader);
+    }
+
+    /// Center and centroid perspective I/J both read as values: DXIL
+    /// allows one perspective `SV_Barycentrics` element (the validator:
+    /// "There can only be up to two input attributes of SV_Barycentrics
+    /// with different perspective interpolation mode"), so the program is
+    /// refused rather than given two, or center weights for centroid ones.
+    #[test]
+    fn center_and_centroid_barycentrics_are_refused() {
+        // v0-v1 perspective center i, j; v2-v3 perspective centroid i, j.
+        let [e0, e1] = exp_mrt0(4);
+        let words = [v_add_f32(4, 0, 3), e0, e1, 0xBF81_0000];
+        match pixel(&words, PERSP_CENTER | PERSP_CENTROID) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert!(what.contains("two perspective modes"), "{what}")
+            }
+            Err(e) => panic!("{e:?}"),
+            Ok(shader) => panic!("translated: {:?}", parts(&shader).1),
+        }
+        // Centroid alone (v2, v3) still translates, with one element.
+        let words = [v_add_f32(4, 2, 3), e0, e1, 0xBF81_0000];
+        let shader = pixel(&words, PERSP_CENTER | PERSP_CENTROID).unwrap();
+        let (_, inputs) = parts(&shader);
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        validate(&shader);
+    }
+
+    /// I and J only fed to `v_interp_*` stay host interpolation: no
+    /// barycentrics are declared.
+    #[test]
+    fn interpolation_alone_declares_no_barycentrics() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0);
+        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        validate(&shader);
+    }
+
+    #[test]
+    fn a_standalone_first_half_reads_the_vertices() {
+        let shader = first_half_pixel(false);
+        let (_, inputs) = parts(&shader);
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    #[test]
+    fn a_dead_first_half_overwritten_by_a_move_adds_no_barycentrics() {
+        let [e0, e1] = exp_mrt0(3);
+        for use_zero in [false, true] {
+            let mut words = vec![
+                0xC808_0000, // dead p1 in v2
+                0x7E04_0280, // v_mov_b32 v2, 0, with entry EXEC unchanged
+                0xC80C_0000, // ordinary p1/p2 in v3 of the same attribute
+                0xC80D_0001,
+            ];
+            if use_zero {
+                words.push(v_add_f32(3, 3, 2));
+            }
+            words.extend([e0, e1, S_ENDPGM]);
+            let shader = pixel(&words, PERSP_CENTER).unwrap();
+            let (features, inputs) = parts(&shader);
+            assert_eq!(features & 0x2_0000, 0);
+            assert!(inputs.iter().all(|e| e.kind != 28));
+            assert_ne!(texcoord_mode(&shader), 1);
+            validate(&shader);
+        }
+    }
+
+    #[test]
+    fn a_masked_move_keeps_the_first_half_outside_exec() {
+        let [e0, e1] = exp_mrt0(2);
+        let shader = pixel(
+            &[
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0x7C02_0300, // v_cmp_lt_f32 vcc, v0, v1
+                0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0xBEFE_0306, // s_mov_b32 exec_lo, s6
+                e0,
+                e1,
+                S_ENDPGM,
+            ],
+            PERSP_CENTER,
+        )
+        .unwrap();
+        let (features, _) = parts(&shader);
+        assert_ne!(features & 0x2_0000, 0);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    #[test]
+    fn a_first_half_read_beside_its_pair_keeps_its_partial_value() {
+        let shader = first_half_pixel(true);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    fn first_half_pixel(paired: bool) -> HostShader {
+        let [e0, e1] = exp_mrt0(2);
+        let mut words = vec![0xC808_0000]; // v_interp_p1_f32 v2, v0, attr0.x
+        if paired {
+            words.extend([
+                0x7E06_0302, // v_mov_b32 v3, v2 (keep the partial value)
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                v_add_f32(2, 2, 3),
+            ]);
+        }
+        words.extend([e0, e1, 0xBF81_0000]);
+        pixel(&words, PERSP_CENTER).unwrap()
+    }
+
+    fn first_half_high_word_pixel() -> HostShader {
+        let [e0, e1] = exp_mrt0(2);
+        pixel_with_half(
+            &[
+                0xD742_0002, 0x0002_0000, // p1ll v2, v0, attr0.x: old destination
+                0xD742_0003, 0x0002_0000, // p1ll v3, v0, attr0.x: pair accumulator
+                0xD75A_0002, 0x040E_0200, // p2_f16 v2, attr0.x, v1, v3
+                e0, e1, S_ENDPGM,
+            ],
+            PERSP_CENTER,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_folded_f16_pair_preserves_the_old_destination_high_word() {
+        let shader = first_half_high_word_pixel();
+        assert_ne!(parts(&shader).0 & 0x2_0000, 0);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    fn modified_f16_pixel(clamp: bool, computed: bool) -> HostShader {
+        let [e0, e1] = exp_mrt0(4);
+        let mut words = vec![0x7E08_02FF, 0x1234_5678]; // old v4: keep the low-half marker
+        if computed {
+            words.push(0x1000_00F0); // scale i in place, requiring actual weighted halves
+        }
+        words.extend([
+            0xD742_0002, 0x0002_0000, // p1ll v2, v0, attr0.x
+            0xD75A_4004 | if clamp { 1 << 15 } else { 0 },
+            0x0C0A_0200, // p2_f16 v4, attr0.x, v1, v2: high destination, mul:2
+            e0, e1, S_ENDPGM,
+        ]);
+        pixel_with_half(&words, PERSP_CENTER, true).unwrap()
+    }
+
+    #[test]
+    fn weighted_f16_keeps_output_modifiers_and_the_destination_half() {
+        for computed in [false, true] {
+            for clamp in [false, true] {
+                let shader = modified_f16_pixel(clamp, computed);
+                assert_eq!(texcoord_mode(&shader) == 1, computed);
+                assert_eq!(parts(&shader).0 & 0x2_0000 != 0, computed);
+                validate(&shader);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn first_half_values_render_on_hardware_and_warp() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Pass POSITION and TEXCOORD through, with TEXCOORD in the same
+        // output row as the translated pixel shader's input signature.
+        let mut s = Shader::new(false);
+        s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+        for e in &mut s.inputs {
+            e.usage = 15;
+        }
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        for (i, e) in s.outputs.iter_mut().enumerate() {
+            e.usage = 15;
+            e.interp = if i == 1 { 4 } else { 2 };
+        }
+        for row in 0..2 {
+            for col in 0..4 {
+                let args = [s.m.i32(row), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                let args = [s.m.i32(1 - row), s.m.i32(0), s.m.i8(col), v];
+                s.op(
+                    s.entry,
+                    "storeOutput.f32",
+                    Attr::NoUnwind,
+                    s.t.void,
+                    5,
+                    &args,
+                );
+            }
+        }
+        s.m.terminate(s.entry, Term::Ret);
+        let vs = HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
+            view_marks: false,
+        };
+        validate(&vs);
+        // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
+        let vertices = [
+            -1.0, 1.0, 0.5, 1.0, 2.0, 0.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 6.0, 0.0, 0.0, 0.0, 3.0,
+            1.0, 0.5, 1.0, 10.0, 0.0, 0.0, 0.0,
+        ];
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let mut options =
+                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: a correctly sized output for the feature query.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .unwrap();
+            }
+            if !options.BarycentricsSupported.as_bool() {
+                eprintln!("no barycentrics on {backend}; skipped");
+                continue;
+            }
+            for case in 0..13 {
+                let ps = match case {
+                    0 | 1 => first_half_pixel(case == 1),
+                    2 => first_half_high_word_pixel(),
+                    3 | 4 => in_place_weights_pixel(case - 3),
+                    5..=8 => modified_f16_pixel(case == 6 || case == 8, case <= 6),
+                    _ => p0_and_pair_pixel(case >= 11, ((case - 9) & 1) as u8).unwrap(),
+                };
+                validate(&ps);
+                let (root, pso) = host.pipeline(&vs, &ps).expect("interpolation pipeline");
+                let out = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: 32,
+                            size: (8, 8),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .expect("draw partial interpolation");
+                for (n, texel) in out.iter().enumerate() {
+                    let i = (n / 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let j = (n % 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let partial = 2.0 + i * 4.0;
+                    let want = match case {
+                        1 => partial + 2.0 + i * 4.0 + j * 8.0,
+                        3 => 2.0 + i * 2.0 + j * 8.0,
+                        4 => 2.0 + i * 4.0 + j * 4.0,
+                        9..=12 => {
+                            2.0 + i * 4.0 + j * 8.0
+                                + if (case - 9).is_multiple_of(2) { 2.0 } else { 0.0 }
+                        }
+                        _ => partial,
+                    };
+                    for &got in texel {
+                        if case == 2 || (5..=8).contains(&case) {
+                            let old = if case == 2 || case >= 7 { partial } else { 2.0 + i * 2.0 };
+                            let full = old + j * 8.0;
+                            let f = match case {
+                                5 | 7 => full * 2.0,
+                                6 | 8 => (full * 2.0).clamp(0.0, 1.0),
+                                _ => full,
+                            };
+                            // Every value in this fixture is exactly representable in f16.
+                            let bits = f.to_bits();
+                            let half = (((bits >> 23) - 112) << 10) | ((bits >> 13) & 0x3ff);
+                            let expected = if case == 2 {
+                                (old.to_bits() & 0xffff_0000) | half
+                            } else {
+                                0x5678 | half << 16
+                            };
+                            assert_eq!(got.to_bits(), expected, "{backend} f16 case={case} pixel={n}");
+                            continue;
+                        }
+                        assert!(
+                            (got - want).abs() < 1e-5,
+                            "{backend} case={case} pixel={n}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+            ran += 1;
+            eprintln!("partial interpolation renders correctly on {backend}");
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 host with barycentrics; GPU checks skipped");
+        }
+    }
+
+    /// Both: the attribute is interpolated and J is used as a value.
+    #[test]
+    fn interpolation_and_a_barycentric_value_together() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            0xC808_0000,        // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,        // v_interp_p2_f32 v2, v1, attr0.x
+            v_add_f32(3, 2, 1), // v3 = attribute + j
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_ne!(features & 0x2_0000, 0);
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        validate(&shader);
+    }
+    /// The `PSV0` interpolation mode of TEXCOORD0 (row 0, x-w, float).
+    fn texcoord_mode(shader: &HostShader) -> u8 {
+        let c = Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        let row = [1, 0, 0x44, 0, 3];
+        let at = psv.windows(5).position(|w| w == row).unwrap();
+        psv[at + 5]
+    }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// An interpolation whose i is computed (`v_mul_f32 v3, 0.5, v0`) reads
+    /// the attribute's vertices: TEXCOORD0 becomes constant, read with
+    /// `attributeAtVertex`; i and j are `SV_Barycentrics` values.
+    #[test]
+    fn computed_barycentrics_read_the_vertices() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0x1006_00F0, // v_mul_f32 v3, 0.5, v0
+            0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    fn in_place_weights_pixel(index: u32) -> HostShader {
+        let [e0, e1] = exp_mrt0(2);
+        pixel(
+            &[
+                0x1000_00F0 | index << 17 | index << 9, // v_mul_f32 v[index], 0.5, v[index]
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                e0, e1, S_ENDPGM,
+            ],
+            PERSP_CENTER,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn barycentrics_modified_in_place_use_their_computed_weights() {
+        for index in 0..2 {
+            let shader = in_place_weights_pixel(index);
+            assert_eq!(texcoord_mode(&shader), 1);
+            assert_ne!(parts(&shader).0 & 0x2_0000, 0);
+            validate(&shader);
+        }
+    }
+
+    #[test]
+    fn a_first_half_used_as_a_computed_weight_is_retained() {
+        let [e0, e1] = exp_mrt0(2);
+        let shader = pixel(
+            &[
+                0xC804_0000, // p1 in v1 replaces the loaded j with a partial value
+                0xC808_0000, // p1 in v2: the pair's accumulator
+                0xC809_0001, // p2 in v2 uses the computed j in v1
+                e0, e1, S_ENDPGM,
+            ],
+            PERSP_CENTER,
+        )
+        .unwrap();
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    /// Weights from constants alone: the vertices, no `SV_Barycentrics`.
+    #[test]
+    fn constant_weights_need_no_barycentrics() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0x7E06_02F0, // v_mov_b32 v3, 0.5
+            0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
+            0xC809_0003, // v_interp_p2_f32 v2, v3, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
+        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    /// The same attribute interpolated with the loaded i and j and with a
+    /// computed j: both from its vertices, the first weighed with
+    /// `SV_Barycentrics`.
+    #[test]
+    fn computed_and_loaded_barycentrics_on_one_attribute() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC810_0100, // v_interp_p1_f32 v4, v0, attr0.y
+            0xC811_0101, // v_interp_p2_f32 v4, v1, attr0.y
+            0x1006_02F0, // v_mul_f32 v3, 0.5, v1
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0003, // v_interp_p2_f32 v2, v3, attr0.x
+            v_add_f32(2, 2, 4),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (_, inputs) = parts(&shader);
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    /// P10 of an attribute the program interpolates is P1 - P0.
+    #[test]
+    fn p10_of_an_interpolated_attribute() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xC812_0000, // v_interp_mov_f32 v4, p10, attr0.x
+            v_add_f32(2, 2, 4),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+        // Alone, what the hardware holds is not known.
+        let [e0, e1] = exp_mrt0(4);
+        let words = [0xC812_0000, e0, e1, S_ENDPGM];
+        assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    fn p0_and_pair_pixel(first: bool, channel: u8) -> Result<HostShader, ShaderError> {
+        let [e0, e1] = exp_mrt0(2);
+        let p0 = 0xC812_0002 | u32::from(channel) << 8; // v_interp_mov_f32 v4, p0, attr0
+        let mut words = Vec::new();
+        if first {
+            words.push(p0);
+        }
+        words.extend([
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+        ]);
+        if !first {
+            words.push(p0);
+        }
+        words.extend([v_add_f32(2, 2, 4), e0, e1, S_ENDPGM]);
+        pixel(&words, PERSP_CENTER)
+    }
+
+    #[test]
+    fn p0_and_an_interpolation_can_share_a_row() {
+        for first in [false, true] {
+            for channel in [0, 1] {
+                let shader = p0_and_pair_pixel(first, channel)
+                    .unwrap_or_else(|e| panic!("P0 first={first}, channel={channel}: {e}"));
+                let (features, inputs) = parts(&shader);
+                assert_ne!(features & 0x2_0000, 0);
+                assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+                assert_eq!(texcoord_mode(&shader), 1);
+                validate(&shader);
+            }
+        }
+    }
+
+    #[test]
+    fn p0_alone_stays_flat_without_barycentrics() {
+        let [e0, e1] = exp_mrt0(4);
+        let shader = pixel(&[0xC812_0002, e0, e1, S_ENDPGM], PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0);
+        assert!(inputs.iter().all(|e| e.kind != 28));
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
     }
 }

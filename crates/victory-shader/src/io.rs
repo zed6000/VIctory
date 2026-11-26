@@ -147,9 +147,9 @@ pub enum Interp {
     /// with `barycentric`; `first` are the `v_interp_p1*` halves it
     /// completes (one per path where the compiler shares a first half).
     /// Where the compiler reused the i or j register on another path,
-    /// `unless` says where it holds something else, which no interpolating
-    /// lane may have been (emission proves it with structurisation's lane
-    /// conditions).
+    /// `unless` says where it holds something else. Emission proves that
+    /// no interpolating lane was there before reusing host interpolation;
+    /// otherwise the halves evaluate with their actual weights.
     Interpolated {
         attribute: Attribute,
         barycentric: Barycentric,
@@ -159,6 +159,11 @@ pub enum Interp {
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
+    /// A half of an interpolation whose i or j is computed rather than
+    /// loaded: each half evaluates as the hardware does, from the
+    /// attribute's vertex values (`v_interp_p1*`: P0 + i P10, with P10 =
+    /// P1 - P0; `v_interp_p2*`: its old dst + j P20, with P20 = P2 - P0).
+    Weighted { attribute: Attribute },
 }
 
 /// Where an interpolation's i or j register holds another value.
@@ -253,6 +258,32 @@ pub struct Io {
     pub lds_outputs: Vec<(Site, Vec<LdsOutput>)>,
     /// Geometry shader stream operations (`s_sendmsg`).
     pub gs_ops: Vec<(Site, GsOp)>,
+}
+
+fn interpolation_attribute(
+    inst: &Inst,
+    attr: &Operand,
+    inputs: &[PsInput],
+) -> Result<Attribute, ShaderError> {
+    let unsupported = |what| ShaderError::Unsupported {
+        offset: inst.machine.offset,
+        what,
+    };
+    match *attr {
+        Operand::Attr { index, chan, high } => inputs
+            .iter()
+            .find(|i| i.attr == index)
+            .map(|i| Attribute {
+                usage: i.usage,
+                row: i.row,
+                channel: chan,
+                high,
+            })
+            .ok_or(unsupported(
+                "an interpolated attribute the stage data does not list",
+            )),
+        _ => Err(unsupported("an interpolation operand")),
+    }
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -365,22 +396,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         .filter_map(|&(reg, v)| loaded.iter().find(|l| l.0 == reg).map(|l| (v, l.1)))
         .collect();
     let input_of = |v: Value| inputs.iter().find(|i| i.0 == v).map(|i| i.1);
-    let attribute = |inst: &Inst, attr: &Operand| match *attr {
-        Operand::Attr { index, chan, high } => ps_inputs
-            .iter()
-            .find(|i: &&PsInput| i.attr == index)
-            .map(|i| Attribute {
-                usage: i.usage,
-                row: i.row,
-                channel: chan,
-                high,
-            })
-            .ok_or(unsupported(
-                inst.machine.offset,
-                "an interpolated attribute the stage data does not list",
-            )),
-        _ => Err(unsupported(inst.machine.offset, "an interpolation operand")),
-    };
+    let attribute = |inst: &Inst, attr: &Operand| interpolation_attribute(inst, attr, ps_inputs);
     // A VGPR value's barycentric kind and index, if it is one as loaded.
     let barycentric = |v: Option<Value>| match v.and_then(input_of) {
         Some(Input::Barycentric { kind, index }) => Some((kind, index)),
@@ -459,13 +475,15 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                     &barycentric,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
-                            io.interps.push((site, interp.with(attribute)));
+                            push_pair(&mut io, site, interp, attribute);
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        attribute(inst, &v.src[0])?;
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -475,7 +493,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         let interp = halves
                             .pair(&v.src[0], read(2), read(1), &barycentric)
                             .map_err(|what| unsupported(at, what))?;
-                        io.interps.push((site, interp.with(attribute)));
+                        push_pair(&mut io, site, interp, attribute);
                     }
                     _ => return Err(unsupported(at, "an interpolation form")),
                 },
@@ -532,6 +550,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         }
         _ => {}
     }
+    let _ = retain_live_first_halves(p, native, &mut io.interps)?;
     Ok(io)
 }
 
@@ -893,6 +912,150 @@ fn raise_es_gs_lds(
     Ok(())
 }
 
+/// Keep first halves used as values. Lowering calls this again after it has
+/// resolved conditional pairs, so native weights are live only where needed.
+pub(crate) fn retain_live_first_halves(
+    p: &Program,
+    native: &NativeProgram,
+    interps: &mut Vec<(Site, Interp)>,
+) -> Result<Option<std::collections::HashSet<Value>>, ShaderError> {
+    let StageIo::Ps { inputs, .. } = &native.io else {
+        return Ok(None);
+    };
+    let mut first_halves = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let attr = match &inst.fields {
+                Fields::Vintrp { attr, .. } if inst.name() == "v_interp_p1_f32" => Some(attr),
+                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => v.src.first(),
+                _ => None,
+            };
+            if let Some(attr) = attr {
+                first_halves.push(((b, i), interpolation_attribute(inst, attr, inputs)?));
+            }
+        }
+    }
+    if first_halves.is_empty() {
+        return Ok(None);
+    }
+    // A loaded i/j pair normally becomes one host interpolation: its first
+    // half need not be evaluated. A first half also read as data (or used
+    // without a second half) must keep P0 + i * P10. Follow phi uses too,
+    // without forcing ordinary pairs to read per-vertex attributes.
+    let folded: std::collections::HashSet<_> = interps
+        .iter()
+        .filter_map(|(s, i)| matches!(i, Interp::Interpolated { .. }).then_some(*s))
+        .collect();
+    let entry = |reg| p.inputs.iter().find(|r| r.0 == reg).map(|r| r.1);
+    let reads: Vec<Vec<Vec<Value>>> = p
+        .blocks
+        .iter()
+        .map(|block| {
+            block
+                .insts
+                .iter()
+                .map(|inst| {
+                    // IR also records the old VGPR destination for EXEC preservation.
+                    // An ordinary full-word move under unchanged entry EXEC does not
+                    // consume it. Masked, DPP and SDWA moves must retain that dependency.
+                    let overwrite = match &inst.fields {
+                        Fields::Valu(v)
+                            if inst.name() == "v_mov_b32"
+                                && v.dpp.is_none()
+                                && v.sdwa.is_none()
+                                && entry(Reg::S(crate::ir::EXEC)).is_some()
+                                && inst.read(Reg::S(crate::ir::EXEC))
+                                    == entry(Reg::S(crate::ir::EXEC))
+                                && (!native.wave64
+                                    || inst.read(Reg::S(crate::ir::EXEC + 1))
+                                        == entry(Reg::S(crate::ir::EXEC + 1))) =>
+                        {
+                            match v.dst {
+                                Some(Operand::Vector { reg, .. })
+                                    if !v.src.iter().any(|s| {
+                                        matches!(*s, Operand::Vector { reg: first, dwords }
+                                if u16::from(reg) >= u16::from(first)
+                                    && u16::from(reg) < u16::from(first) + u16::from(dwords))
+                                    }) =>
+                                {
+                                    Some(Reg::V(reg))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    inst.reads
+                        .iter()
+                        .filter(|r| Some(r.0) != overwrite)
+                        .map(|r| r.1)
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    let mut used = std::collections::HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            // Effects need their operands. Scalar writes may feed a branch;
+            // conservatively retain them even when its control use is implicit.
+            if matches!(inst.fields, Fields::Exp { .. })
+                || inst.name().contains("store")
+                || inst.name().contains("atomic")
+                || inst
+                    .writes
+                    .iter()
+                    .any(|w| matches!(w.0, Reg::S(_) | Reg::Scc))
+            {
+                used.extend(reads[b][i].iter().copied());
+            }
+        }
+    }
+    loop {
+        let before = used.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if used.contains(&phi.value) {
+                used.extend(&phi.args);
+            }
+        }
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                if !inst.writes.iter().any(|w| used.contains(&w.1)) {
+                    continue;
+                }
+                if folded.contains(&(b, i)) {
+                    // Folding replaces the pair's arithmetic inputs, but f16 p2
+                    // still preserves the destination half it does not write. This
+                    // may differ from the pair's explicit accumulator VGPR.
+                    if inst.name() == "v_interp_p2_f16"
+                        && let Fields::Valu(v) = &inst.fields
+                        && let Some(Operand::Vector { reg, .. }) = v.dst
+                        && let Some(old) = inst.read(Reg::V(reg))
+                    {
+                        used.insert(old);
+                    }
+                } else {
+                    used.extend(reads[b][i].iter().copied());
+                }
+            }
+        }
+        if used.len() == before {
+            break;
+        }
+    }
+    for (site, attribute) in first_halves {
+        if !interps.iter().any(|(s, _)| *s == site)
+            && p.blocks[site.0].insts[site.1]
+                .writes
+                .iter()
+                .any(|w| used.contains(&w.1))
+        {
+            interps.push((site, Interp::Weighted { attribute }));
+        }
+    }
+    Ok(Some(used))
+}
+
 /// The pixel input VGPRs that `addr` enables, with their meaning.
 fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
     let mut out = Vec::new();
@@ -913,22 +1076,39 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
     out
 }
 
-/// An interpolation before its attribute is known.
+/// An interpolation before its attribute is known: `barycentric` none
+/// when i or j is computed.
 struct Pair {
-    barycentric: Barycentric,
+    barycentric: Option<Barycentric>,
     first: Vec<Site>,
     unless: Vec<Elsewhere>,
 }
 
 impl Pair {
     fn with(self, attribute: Attribute) -> Interp {
-        Interp::Interpolated {
-            attribute,
-            barycentric: self.barycentric,
-            first: self.first,
-            unless: self.unless,
+        match self.barycentric {
+            Some(barycentric) => Interp::Interpolated {
+                attribute,
+                barycentric,
+                first: self.first,
+                unless: self.unless,
+            },
+            None => Interp::Weighted { attribute },
         }
     }
+}
+
+/// Records interpolation `pair` at `site`, and its first halves too when
+/// they evaluate on their own (computed barycentrics).
+fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute) {
+    if pair.barycentric.is_none() {
+        for &f in &pair.first {
+            if !io.interps.iter().any(|(s, _)| *s == f) {
+                io.interps.push((f, Interp::Weighted { attribute }));
+            }
+        }
+    }
+    io.interps.push((site, pair.with(attribute)));
 }
 
 /// Finds the first halves of interpolations.
@@ -941,7 +1121,9 @@ struct Halves<'a> {
 impl Halves<'_> {
     /// The interpolation whose second half reads the first half's result
     /// `acc`, the barycentric `j`, and attribute `attr`: every first half
-    /// must read the same attribute channel and the same kind's i.
+    /// must read the same attribute channel. With j and every first half's
+    /// i loaded as one kind's, the pair interpolates with that kind;
+    /// otherwise each half evaluates on its own (`Interp::Weighted`).
     fn pair(
         &self,
         attr: &Operand,
@@ -956,8 +1138,9 @@ impl Halves<'_> {
             &mut first,
         )?;
         let mut unless = Vec::new();
-        let Some((kind, 1)) = self.joined(j, barycentric, &mut unless) else {
-            return Err("an interpolation with computed barycentrics");
+        let mut kind = match self.joined(j, barycentric, &mut unless) {
+            Some((kind, 1)) => Some(kind),
+            _ => None,
         };
         for &(b, i) in &first {
             let inst = &self.p.blocks[b].insts[i];
@@ -976,8 +1159,8 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if self.joined(i, barycentric, &mut unless) != Some((kind, 0)) {
-                return Err("an interpolation with computed barycentrics");
+            if kind.is_some_and(|k| self.joined(i, barycentric, &mut unless) != Some((k, 0))) {
+                kind = None;
             }
         }
         Ok(Pair {
@@ -1175,6 +1358,77 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn computed_barycentrics_evaluate_each_half() {
+        // i scaled before the first half: both halves stand on their own.
+        let p = program(&[
+            0x1006_00F0, // v_mul_f32 v3, 0.5, v0
+            0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        let attribute = Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel: 0,
+            high: false,
+        };
+        let mut interps = io.interps.clone();
+        interps.sort_by_key(|i| i.0);
+        assert_eq!(
+            interps,
+            [
+                ((0, 1), Interp::Weighted { attribute }),
+                ((0, 2), Interp::Weighted { attribute }),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_halves_read_through_a_phi_keep_their_partial_values() {
+        let p = program(&[
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> second first half
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xBF82_0001, // s_branch -> export
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 2);
+        assert!(
+            io.interps
+                .iter()
+                .all(|(_, i)| matches!(i, Interp::Weighted { .. }))
+        );
+    }
+
+    #[test]
+    fn a_standalone_f16_first_half_is_weighted() {
+        let p = program(&[
+            0xD742_0002,
+            0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+            0xF800_180F,
+            0x0202_0202,
+            S_ENDPGM,
+        ]);
+        let io = raise(
+            &p,
+            &pixel(
+                vec![PsInput {
+                    fp16: true,
+                    ..TEXCOORD
+                }],
+                2,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(&io.interps[..], [(_, Interp::Weighted { .. })]));
     }
 
     #[test]

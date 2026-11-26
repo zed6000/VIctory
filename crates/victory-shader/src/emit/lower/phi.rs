@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use super::{Lower, MaskData, Stop, Val, Why, unsupported};
 use crate::emit::bitcode::V;
 use crate::gfx10::{Fields, NULL, Operand};
+use crate::io::Input;
 use crate::ir::{Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
@@ -182,7 +183,22 @@ impl Lower<'_> {
                         continue;
                     }
                     let arg = phi.args[n];
+                    // Keep the counted indexed-write proof ahead of lazy input
+                    // loading: the original value is never observed on this edge.
+                    let overwritten_input = !bit
+                        && self.x.io.inputs.iter().any(|&(v, input)| {
+                            v == arg && matches!(input, Input::Barycentric { .. })
+                        })
+                        && self.overwritten_movreld_edge(b, phi, n).is_some();
+                    if !overwritten_input
+                        && !self.vals.contains_key(&arg)
+                        && !self.never_taken(q, b)
+                        && !self.dead_on_edge(b, n, phi.reg)
+                    {
+                        let _ = self.lazy_barycentric(arg);
+                    }
                     let x = match (self.vals.get(&arg).copied(), bit) {
+                        _ if overwritten_input => self.s.m.undef(self.s.t.i32),
                         (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                         // No lane from this edge reads it, or no lane comes
                         // along it at all: any value will do.
@@ -192,13 +208,6 @@ impl Lower<'_> {
                             } else {
                                 self.s.m.i32(0)
                             }
-                        }
-                        // An input an unguarded counted `v_movreld` loop overwrites
-                        // before anything reads it (PR #457).
-                        (Some(Val::Missing("barycentrics read directly")), false)
-                            if self.overwritten_movreld_edge(b, phi, n).is_some() =>
-                        {
-                            self.s.m.undef(self.s.t.i32)
                         }
                         (Some(Val::Bit(_)), false) => {
                             return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
