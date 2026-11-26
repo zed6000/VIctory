@@ -102,6 +102,16 @@ pub(crate) enum Sym {
         lanes: u64,
         hi: u32,
     },
+    /// One dword (`high`: the upper) of the binary64 sum over `lanes` of
+    /// `mask ? (lo, hi) : +0.0`, the pair a lane holds in two registers
+    /// (`v_add_f64` steps; their DPP moves go a dword at a time).
+    Red64 {
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        lanes: u64,
+        high: bool,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -118,6 +128,8 @@ pub(crate) enum Shape {
     /// [`Sym::Half`] over every lane: `op`, src, mask, identity, the lane
     /// giving the high half.
     Half(Op, Value, Value, u32, u32),
+    /// [`Sym::Red64`] over every lane: lo, hi, mask, and which dword.
+    Sum64(Value, Value, Value, bool),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -211,6 +223,72 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
             }
         }
     }
+}
+
+/// A lane's binary64 pair as a term of a sum: +0.0 (`Some(None)`), or
+/// `mask ? (lo, hi) : +0.0` over some lanes.
+fn term64(lo: Sym, hi: Sym) -> Option<Option<(Value, Value, Value, u64)>> {
+    match (lo, hi) {
+        (Sym::K(0), Sym::K(0)) => Some(None),
+        (
+            Sym::Red {
+                op: None,
+                src: a,
+                mask,
+                ident: 0,
+                lanes,
+            },
+            Sym::Red {
+                op: None,
+                src: b,
+                mask: m,
+                ident: 0,
+                lanes: l,
+            },
+        ) if (mask, lanes) == (m, l) => Some(Some((a, b, mask, lanes))),
+        (
+            Sym::Red64 {
+                lo,
+                hi,
+                mask,
+                lanes,
+                high: false,
+            },
+            Sym::Red64 {
+                lo: l2,
+                hi: h2,
+                mask: m2,
+                lanes: n2,
+                high: true,
+            },
+        ) if (lo, hi, mask, lanes) == (l2, h2, m2, n2) => Some(Some((lo, hi, mask, lanes))),
+        _ => None,
+    }
+}
+
+/// A lane of `v_add_f64` on two (low, high) pairs: the sum's dwords where
+/// both are terms of one masked sum over lanes counted once.
+fn add64(a: (Sym, Sym), b: (Sym, Sym)) -> (Sym, Sym) {
+    let unknown = (Sym::Unknown, Sym::Unknown);
+    let (Some(x), Some(y)) = (term64(a.0, a.1), term64(b.0, b.1)) else {
+        return unknown;
+    };
+    let (lo, hi, mask, lanes) = match (x, y) {
+        (None, None) => return (Sym::K(0), Sym::K(0)),
+        (Some(t), None) | (None, Some(t)) => t,
+        (Some(s), Some(t)) if (s.0, s.1, s.2) == (t.0, t.1, t.2) && s.3 & t.3 == 0 => {
+            (s.0, s.1, s.2, s.3 | t.3)
+        }
+        _ => return unknown,
+    };
+    let half = |high| Sym::Red64 {
+        lo,
+        hi,
+        mask,
+        lanes,
+        high,
+    };
+    (half(false), half(true))
 }
 
 fn combine(op: Op, a: Sym, b: Sym) -> Sym {
@@ -360,8 +438,23 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             {
                 masked.push(w);
             }
+            // A copy holds what its source holds (a sum's dword moved to
+            // the register that leaves the section).
+            let copied = match src.first() {
+                Some(&Operand::Scalar { code, .. }) if name == "s_mov_b32" && code != NULL => inst
+                    .read(Reg::S(code))
+                    .map(|x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
+                _ => None,
+            };
             for &(_, w) in &inst.writes {
-                uni.entry(w).or_insert(Sym::Unknown);
+                match copied {
+                    Some(s) => {
+                        uni.insert(w, s);
+                    }
+                    None => {
+                        uni.entry(w).or_insert(Sym::Unknown);
+                    }
+                }
             }
             continue;
         }
@@ -430,6 +523,62 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
         let Some(dst) = inst.write(Reg::V(dreg)) else {
             continue;
         };
+        if name == "v_add_f64" {
+            // Each source as a lane's (low, high) dwords.
+            let pair = |op: Option<&Operand>| -> Vec<(Sym, Sym)> {
+                let unknown = vec![(Sym::Unknown, Sym::Unknown); wave as usize];
+                match op.copied() {
+                    Some(Operand::Vector { reg, .. }) if reg < u8::MAX => {
+                        let half = |r: u8| match inst.read(Reg::V(r)) {
+                            Some(x) => vec
+                                .get(&x)
+                                .cloned()
+                                .unwrap_or_else(|| vec![Sym::Own(x); wave as usize]),
+                            None => vec![Sym::Unknown; wave as usize],
+                        };
+                        half(reg).into_iter().zip(half(reg + 1)).collect()
+                    }
+                    Some(Operand::Scalar { code, .. }) if code < 105 => {
+                        let half = |c: u8| {
+                            inst.read(Reg::S(c)).map_or(Sym::Unknown, |x| {
+                                uni.get(&x).copied().unwrap_or(Sym::Uni(x))
+                            })
+                        };
+                        vec![(half(code), half(code + 1)); wave as usize]
+                    }
+                    // Inline 0 is +0.0 as a binary64 too.
+                    Some(Operand::Const(128)) => vec![(Sym::K(0), Sym::K(0)); wave as usize],
+                    _ => unknown,
+                }
+            };
+            let (a, b) = (pair(v.src.first()), pair(v.src.get(1)));
+            let hi_dst = (dreg < u8::MAX)
+                .then(|| inst.write(Reg::V(dreg + 1)))
+                .flatten();
+            for (high, d, r) in [
+                (false, Some(dst), dreg),
+                (true, hi_dst, dreg.wrapping_add(1)),
+            ] {
+                let Some(d) = d else {
+                    continue;
+                };
+                let old = lanes(&Operand::Vector { reg: r, dwords: 1 }, &vec, &uni);
+                let merged = (0..wave as usize)
+                    .map(|l| {
+                        if exec >> l & 1 == 0 {
+                            old[l]
+                        } else if modifiers || v.dpp.is_some() {
+                            Sym::Unknown
+                        } else {
+                            let (lo, hi) = add64(a[l], b[l]);
+                            if high { hi } else { lo }
+                        }
+                    })
+                    .collect();
+                vec.insert(d, merged);
+            }
+            continue;
+        }
         let old = lanes(
             &Operand::Vector {
                 reg: dreg,
@@ -636,6 +785,13 @@ fn shapes(
             lanes,
             hi,
         } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
+        Sym::Red64 {
+            lo,
+            hi,
+            mask,
+            lanes,
+            high,
+        } if lanes == all => Some(Shape::Sum64(lo, hi, mask, high)),
         _ => None,
     };
     for (v, s) in uni {
@@ -679,6 +835,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::Red64 {
+                lo,
+                hi,
+                mask,
+                lanes,
+                high,
+            } if lanes == all => Some(Shape::Sum64(lo, hi, mask, high)),
             _ => None,
         };
     }
@@ -1048,6 +1211,74 @@ mod tests {
                 .collect();
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
+        }
+    }
+
+    /// A wave32 binary64 sum as the compiler expands it: each dword of the
+    /// pair moved by DPP on its own, `v_add_f64` on the pairs, the rows
+    /// joined with `v_permlanex16`, the result read from lane 31 and copied
+    /// to the registers that leave the section.
+    fn f64_sum(twice: bool) -> (HashMap<Value, Shape>, [Value; 4], Value, Value, Value) {
+        let mut w = vec![sop1(0, 0x3D, 193)]; // s_or_saveexec_b32 s0, -1
+        w.extend(vop3(2, 0x101, 128, 256, 0)); // v_cndmask_b32 v2, 0, v0, s0
+        w.extend(vop3(3, 0x101, 128, 257, 0)); // v_cndmask_b32 v3, 0, v1, s0
+        if twice {
+            w.extend(vop3(2, 0x164, 258, 258, 0)); // v_add_f64 v[2:3], v[2:3], v[2:3]
+        }
+        for ctrl in [0x00B1u16, 0x004E, 0x0164, 0x0168] {
+            w.push(vop1(4, 0x01, 0xFA)); // v_mov_b32 v4, v2 (DPP)
+            w.push(dpp16(2, ctrl, 0xF, 0xF, false));
+            w.push(vop1(5, 0x01, 0xFA)); // v_mov_b32 v5, v3 (DPP)
+            w.push(dpp16(3, ctrl, 0xF, 0xF, false));
+            w.extend(vop3(2, 0x164, 260, 258, 0)); // v_add_f64 v[2:3], v[4:5], v[2:3]
+        }
+        w.extend(vop3(4, 0x378, 258, 128, 128)); // v_permlanex16_b32 v4, v2, 0, 0
+        w.extend(vop3(5, 0x378, 259, 128, 128)); // v_permlanex16_b32 v5, v3, 0, 0
+        w.extend(vop3(2, 0x164, 260, 258, 0)); // v_add_f64 v[2:3], v[4:5], v[2:3]
+        w.extend(vop3(2, 0x360, 258, 128 + 31, 0)); // v_readlane_b32 s2, v2, 31
+        w.extend(vop3(3, 0x360, 259, 128 + 31, 0)); // v_readlane_b32 s3, v3, 31
+        w.push(sop1(4, 0x03, 2)); // s_mov_b32 s4, s2
+        w.push(sop1(5, 0x03, 3)); // s_mov_b32 s5, s3
+        w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+
+        let p = build(&w, false);
+        let insts = &p.blocks[0].insts;
+        let at = |name: &str, r: Reg| {
+            insts
+                .iter()
+                .rev()
+                .find(|i| i.name() == name && i.write(r).is_some())
+                .and_then(|i| i.write(r))
+                .unwrap()
+        };
+        let out = [
+            at("v_readlane_b32", Reg::S(2)),
+            at("v_readlane_b32", Reg::S(3)),
+            at("s_mov_b32", Reg::S(4)),
+            at("s_mov_b32", Reg::S(5)),
+        ];
+        let saved = insts[0].write(Reg::S(0)).unwrap();
+        let (v0, v1) = (
+            insts[1].read(Reg::V(0)).unwrap(),
+            insts[2].read(Reg::V(1)).unwrap(),
+        );
+        let shapes = sections(&p, 0).remove(&0).unwrap().shapes;
+        (shapes, out, v0, v1, saved)
+    }
+
+    #[test]
+    fn a_binary64_sum_is_followed_through_its_dwords() {
+        let (shapes, [s2, s3, s4, s5], v0, v1, saved) = f64_sum(false);
+        for (v, high) in [(s2, false), (s3, true), (s4, false), (s5, true)] {
+            assert_eq!(shapes.get(&v), Some(&Shape::Sum64(v0, v1, saved, high)));
+        }
+    }
+
+    #[test]
+    fn a_binary64_sum_counting_a_lane_twice_is_not_a_sum() {
+        let (shapes, out, ..) = f64_sum(true);
+        for v in out {
+            assert_eq!(shapes.get(&v), None);
         }
     }
 

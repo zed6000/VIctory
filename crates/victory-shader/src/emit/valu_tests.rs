@@ -79,6 +79,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 }
 
 fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    try_build_valu_cs_lanes(body, 1)
+}
+
+/// [`try_build_valu_cs`] with `lanes` threads in the group (one wave of 32
+/// at most); `v0` holds each thread's index.
+fn try_build_valu_cs_lanes(body: &[u32], lanes: u32) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -127,7 +133,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [lanes, 1, 1],
         }),
         code,
     };
@@ -193,7 +199,27 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_on(shader, cases, check, false);
+}
+
+/// [`run_cases`] for a program that declares the console's wave of 32 (a
+/// whole-wave section): WARP's 4-lane waves refuse it, so WARP is skipped
+/// there, as in `synthetic_tests`.
+fn run_cases_wave32(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_on(shader, cases, check, true);
+}
+
+fn run_cases_on(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
+    wave32: bool,
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
@@ -205,9 +231,14 @@ fn run_cases(
                 continue;
             }
         };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(p) => p,
+            Err(e) if wave32 && warp => {
+                eprintln!("{label}: no pipeline for a wave of 32 ({e}); skipped");
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -2281,5 +2312,131 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
             "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
             inp[0], inp[1],
         );
+    });
+}
+
+/// A whole-wave binary64 sum as the console compiler expands
+/// `WaveActiveSum` of a double (each dword moved by DPP on its own,
+/// `v_add_f64` on the pairs, the rows joined by `v_permlanex16`, lane 31 read
+/// and copied out), then converted with `v_cvt_f32_f64`. One thread: the sum
+/// is its own value, so the result is `x as f32`.
+#[test]
+fn a_whole_wave_binary64_sum_reaches_the_host() {
+    let mut body = vec![0xBE94_3DC1]; // s_or_saveexec_b32 s20, -1
+    body.extend(vop3(0x101, 5, 128, vgpr(1), sgpr(20))); // v_cndmask_b32 v5, 0, v1, s20
+    body.extend(vop3(0x101, 6, 128, vgpr(2), sgpr(20))); // v_cndmask_b32 v6, 0, v2, s20
+    for ctrl in [0x00B1u32, 0x004E, 0x0164, 0x0168] {
+        // v_mov_b32 v7, v5 and v8, v6 (DPP), then v_add_f64 v[5:6], v[7:8], v[5:6]
+        body.extend([vop1(1, 7, 0xFA), 0xFF00_0000 | ctrl << 8 | 5]);
+        body.extend([vop1(1, 8, 0xFA), 0xFF00_0000 | ctrl << 8 | 6]);
+        body.extend(vop3(0x164, 5, vgpr(7), vgpr(5), 0));
+    }
+    body.extend(vop3(0x378, 7, vgpr(5), 128, 128)); // v_permlanex16_b32 v7, v5, 0, 0
+    body.extend(vop3(0x378, 8, vgpr(6), 128, 128)); // v_permlanex16_b32 v8, v6, 0, 0
+    body.extend(vop3(0x164, 5, vgpr(7), vgpr(5), 0)); // v_add_f64 v[5:6], v[7:8], v[5:6]
+    body.extend(vop3(0x360, 22, vgpr(5), 128 + 31, 0)); // v_readlane_b32 s22, v5, 31
+    body.extend(vop3(0x360, 23, vgpr(6), 128 + 31, 0)); // v_readlane_b32 s23, v6, 31
+    body.push(s_mov_b32(24, 22));
+    body.push(s_mov_b32(25, 23));
+    body.push(s_mov_b32(126, 20)); // s_mov_b32 exec_lo, s20
+    body.push(vop1(0x00f, 0, sgpr(24))); // v_cvt_f32_f64 v0, s[24:25]
+    let shader = build_valu_cs(&body);
+    let cases = [1.0f64, -2.5, 3.0e10, 0.1, 0.0].map(|x| {
+        let b = x.to_bits();
+        [b as u32, (b >> 32) as u32, 0, 0]
+    });
+    run_cases_wave32(&shader, &cases, |backend, i, [lo, hi, _, _], got| {
+        let want = f64::from_bits(u64::from(hi) << 32 | u64::from(lo)) as f32;
+        assert_eq!(got, want.to_bits(), "{backend}: case {i}");
+    });
+}
+
+/// The same section over a wave of 32 with only lanes below `s2` active (a
+/// `v_cmp` and `s_and_saveexec` before it): lane `l` adds 2^l (high dword
+/// `s1 + (l << 20)`), so the sum is 2^s2 - 1 whatever the order, and the
+/// inactive lanes' +0.0 must not count.
+#[test]
+fn a_whole_wave_binary64_sum_counts_the_active_lanes_only() {
+    let mut body = Vec::new();
+    body.extend(vop3(0x11A, 2, 128 + 20, vgpr(0), 0)); // v_lshlrev_b32 v2, 20, v0
+    body.extend(vop3(0x125, 2, sgpr(1), vgpr(2), 0)); // v_add_nc_u32 v2, s1, v2
+    body.extend(vop3(0x0C4, 106, sgpr(2), vgpr(0), 0)); // v_cmp_gt_u32 vcc_lo, s2, v0
+    body.push(0xBE95_3C6A); // s_and_saveexec_b32 s21, vcc_lo
+    body.push(0xBE94_3DC1); // s_or_saveexec_b32 s20, -1
+    body.extend(vop3(0x101, 5, 128, vgpr(1), sgpr(20))); // v_cndmask_b32 v5, 0, v1, s20
+    body.extend(vop3(0x101, 6, 128, vgpr(2), sgpr(20))); // v_cndmask_b32 v6, 0, v2, s20
+    for ctrl in [0x00B1u32, 0x004E, 0x0164, 0x0168] {
+        body.extend([vop1(1, 7, 0xFA), 0xFF00_0000 | ctrl << 8 | 5]);
+        body.extend([vop1(1, 8, 0xFA), 0xFF00_0000 | ctrl << 8 | 6]);
+        body.extend(vop3(0x164, 5, vgpr(7), vgpr(5), 0));
+    }
+    body.extend(vop3(0x378, 7, vgpr(5), 128, 128)); // v_permlanex16_b32 v7, v5, 0, 0
+    body.extend(vop3(0x378, 8, vgpr(6), 128, 128)); // v_permlanex16_b32 v8, v6, 0, 0
+    body.extend(vop3(0x164, 5, vgpr(7), vgpr(5), 0)); // v_add_f64 v[5:6], v[7:8], v[5:6]
+    body.extend(vop3(0x360, 22, vgpr(5), 128 + 31, 0)); // v_readlane_b32 s22, v5, 31
+    body.extend(vop3(0x360, 23, vgpr(6), 128 + 31, 0)); // v_readlane_b32 s23, v6, 31
+    body.push(s_mov_b32(24, 22));
+    body.push(s_mov_b32(25, 23));
+    body.push(s_mov_b32(126, 20)); // s_mov_b32 exec_lo, s20
+    body.push(vop1(0x00f, 0, sgpr(24))); // v_cvt_f32_f64 v0, s[24:25]
+    let shader = try_build_valu_cs_lanes(&body, 32).expect("build");
+    let cases = [1u32, 5, 17, 31, 32].map(|n| [0, 0x3FF0_0000, n, 0]);
+    run_cases_wave32(&shader, &cases, |backend, i, [_, _, n, _], got| {
+        let want = ((1u64 << n) - 1) as f64 as f32;
+        assert_eq!(got, want.to_bits(), "{backend}: case {i}, {n} lanes");
+    });
+}
+
+/// `v_cvt_f32_f64`: the pair v1:v2 read as binary64, truncated to f32 bits
+/// in v0 with MODE's default round mode (nearest even). The host does the
+/// conversion with `fptrunc`, so Rust's `as f32` is the expectation.
+#[test]
+fn a_64_bit_value_converts_to_f32_round_to_nearest() {
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let cases = [
+        [0x0000_0000, 0x3FF0_0000, 0, 0], // 1.0
+        [0x0000_0000, 0xC004_0000, 0, 0], // -2.5
+        [0x9999_999A, 0x3FB9_9999, 0, 0], // 0.1
+        [0x1000_0000, 0x3FF0_0000, 0, 0], // 1 + 2^-24: a tie, to even (1.0)
+        [0x0000_0001, 0x0000_0000, 0, 0], // the smallest subnormal: 0
+        [0xFFFF_FFFF, 0x000F_FFFF, 0, 0], // just below f32's smallest: 0
+        [0xFFFF_FFFF, 0x7FEF_FFFF, 0, 0], // f64 max: inf
+        [0x0000_0000, 0x7FF0_0000, 0, 0], // +inf
+        [0x0000_0000, 0xFFF0_0000, 0, 0], // -inf
+        [0x0000_0000, 0x7FF8_0000, 0, 0], // a quiet NaN
+    ];
+    run_cases(&shader, &cases, |backend, i, [lo, hi, _, _], got| {
+        let v = f64::from_bits(u64::from(hi) << 32 | u64::from(lo));
+        let want = v as f32;
+        if want.is_nan() {
+            assert_eq!(got & 0x7F80_0000, 0x7F80_0000, "{backend}: case {i} is a NaN");
+            assert_ne!(got & 0x007F_FFFF, 0, "{backend}: case {i} keeps a payload");
+        } else {
+            assert_eq!(got, want.to_bits(), "{backend}: case {i} {v:e}");
+        }
+    });
+}
+
+/// A literal source of `v_cvt_f32_f64` is the *high* word of the binary64
+/// (RDNA 2 ISA 6.2.1), the low word being zero: 0xC0020000 is -2.25, not
+/// the sign-extended integer its bits would otherwise be.
+#[test]
+fn a_64_bit_literal_source_is_the_high_word() {
+    let shader = build_valu_cs(&[vop1(0x00f, 0, 255), 0xC002_0000]);
+    let cases = [[0u32, 0, 0, 0]];
+    run_cases(&shader, &cases, |backend, i, _in, got| {
+        assert_eq!(got, (-2.25f32).to_bits(), "{backend}: case {i}");
+    });
+}
+
+/// An inline float constant source of `v_cvt_f32_f64` is that value as a
+/// binary64 (RDNA 2 ISA 6.2.1): 242 is 1.0, not the f32 bit pattern
+/// 0x000000003F800000 (a subnormal, which converts to 0).
+#[test]
+fn a_64_bit_inline_constant_source_is_the_same_value() {
+    let shader = build_valu_cs(&[vop1(0x00f, 0, 242)]);
+    let cases = [[0u32, 0, 0, 0]];
+    run_cases(&shader, &cases, |backend, i, _in, got| {
+        assert_eq!(got, 1.0f32.to_bits(), "{backend}: case {i}");
     });
 }

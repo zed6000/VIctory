@@ -63,6 +63,8 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    /// 64-bit floating point (`fptrunc` from a `double`).
+    pub const FLOAT64: u64 = 1 << 2;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -980,6 +982,9 @@ impl Shader {
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
+        }
+        if self.flags & flags::FLOAT64 != 0 {
+            features |= 0x1;
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;

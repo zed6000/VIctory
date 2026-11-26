@@ -23,6 +23,7 @@ use crate::resource::{Address, CODE, GS_TABLE, MEMORY, Resources, Role, Site, So
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod sum64;
 
 type Why = &'static str;
 
@@ -308,6 +309,9 @@ struct Lower<'a> {
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
     join_handles: HashMap<(String, bool, u32), V>,
+    /// Binary64 sums whole-wave sections leave (as i64), by block, low and
+    /// high source dwords and mask: one wave operation serves both dwords.
+    sums64: HashMap<(usize, Value, Value, Value), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -864,6 +868,7 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             entry_handles: HashMap::new(),
             join_handles: HashMap::new(),
+            sums64: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1321,6 +1326,7 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::Sum64(lo, hi, mask, high) => return self.sum64(lo, hi, mask, high),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -6702,6 +6708,54 @@ impl<'a> Lower<'a> {
                     r = self.s.m.select(c, nan, sat, r);
                 }
                 int(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                // A 64-bit source truncated to f32, as the host's `fptrunc`:
+                // that rounds to nearest even, which is MODE's default; every
+                // other 64-bit round mode (directed, or written at run time)
+                // has no DXIL form and is refused rather than mis-rounded.
+                if self.mode16 != Some(0) {
+                    return Err("a 64-bit conversion in a directed or unknown round mode");
+                }
+                // The literal form below builds the 64 bits with integer
+                // shifts, so the module uses both features.
+                self.s.flags |= flags::FLOAT64 | flags::INT64;
+                // A literal source is the *high* word of the binary64 (RDNA 2
+                // ISA 6.2.1): the low word is zero. A register pair comes
+                // through `src64` as the integer its bits are.
+                let Fields::Valu(v) = &inst.fields else {
+                    return Err("a 64-bit source");
+                };
+                let i64t = self.s.m.int(64);
+                let x = match v.src.first().copied() {
+                    Some(Operand::Literal(k)) => {
+                        let k32 = self.s.m.i32(k);
+                        let hi = self.s.m.cast(c, Cast::ZExt, k32, i64t);
+                        let thirty_two = self.s.m.int_const(i64t, 32);
+                        self.s.m.bin(c, Bin::Shl, hi, thirty_two)
+                    }
+                    // An inline f32 constant is the same value as a binary64
+                    // in a 64-bit float operand, not its f32 bits widened.
+                    Some(Operand::Const(c @ 240..=248)) => {
+                        let x = [
+                            0.5f64,
+                            -0.5,
+                            1.0,
+                            -1.0,
+                            2.0,
+                            -2.0,
+                            4.0,
+                            -4.0,
+                            1.0 / (2.0 * std::f64::consts::PI),
+                        ][usize::from(c - 240)];
+                        self.s.m.int_const(i64t, x.to_bits() as i64)
+                    }
+                    _ => self.src64(inst, 0)?,
+                };
+                let double = self.s.m.double();
+                let bits = self.s.m.cast(c, Cast::Bitcast, x, double);
+                let r = self.s.m.cast(c, Cast::FpTrunc, bits, self.s.t.f32);
+                float(self, r)
             }
             "v_cvt_f32_u32" => {
                 // WARP can misround a full-width uitofp. Each 16-bit
