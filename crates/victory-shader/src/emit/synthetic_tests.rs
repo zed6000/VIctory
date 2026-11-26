@@ -1029,3 +1029,188 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
     // never spinning to LOOP_LIMIT (1 << 20).
     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }
+
+/// Per lane of a [8, 8, 1] group (v0 = x, v1 = y): (u, v) from entry 1 of
+/// the table at s0 at the flat index x + 8y, `image_sample` of red with an
+/// implicit level (the culling shaders' sampler), stored at flat × 4.
+fn quad_program() -> Vec<u32> {
+    vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0502,
+        0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 0x20
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xB008_01B6, // s_movk_i32 s8, 0x1b6
+        0xBE89_03FF,
+        0x00C0_0000, // s_mov_b32 s9, 0xc00000
+        0xBE8A_03FF,
+        0x1850_0000, // s_mov_b32 s10, 0x18500000
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0x3404_0283, // v_lshlrev_b32 v2, 3, v1
+        0x4A04_0500, // v_add_nc_u32 v2, v0, v2
+        0x3420_0483, // v_lshlrev_b32 v16, 3, v2
+        0x3428_0482, // v_lshlrev_b32 v20, 2, v2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE034_1000,
+        0x8005_0C10, // buffer_load_dwordx2 v[12:13], v16, s[20:23], 0 offen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF080_0108,
+        0x0043_040C, // image_sample v4, v[12:13], s[12:19], s[8:11] dmask:0x1 dim:2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0414, // buffer_store_dword v4, v20, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]
+}
+
+/// An implicit-level `image_sample` in a [8, 8, 1] compute group takes its
+/// derivatives as the console's hardware does: across quads of lanes
+/// (lanes 4k..4k+3, threads in x-major order, so four threads of one row),
+/// lane 1 less lane 0 and lane 2 less lane 0. Not across 2x2 tiles of
+/// thread ids, as SM 6.6 compute derivatives define them for 2D groups.
+///
+/// u steps two texels every second x, v eight texels per y, so each
+/// derivative pair has one nonzero vector and the level does not depend on
+/// how the sampler combines them. Lane quads (x, x+1, x+2 of one row):
+/// ddx = 0, ddy = 2 texels along u: level 1. 2x2 tiles: ddx = 0, ddy = 8
+/// texels along v: level 3. Each level of the 64x64 texture holds its own
+/// number, so red is the level sampled.
+#[test]
+fn compute_samples_take_derivatives_from_lane_quads() {
+    let size = 64u32;
+    let levels = 7u32;
+    let mut texels = Vec::new();
+    for l in 0..levels {
+        let n = (size >> l) as usize;
+        texels.extend(vec![[l as f32, 0.0, 0.0, 1.0]; n * n]);
+    }
+    let input: Vec<u32> = (0..64u32)
+        .flat_map(|f| {
+            let (x, y) = (f % 8, f / 8);
+            let u = (16.0 + 2.0 * (x / 2) as f32 + 0.5) / size as f32;
+            let v = (4.0 + 8.0 * y as f32 + 0.5) / size as f32;
+            [u.to_bits(), v.to_bits()]
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for wave64 in [false, true] {
+        let shader = match build_group(&quad_program(), wave64, [8, 8, 1], 1 << 1 | 1 << 11) {
+            Ok(s) => s,
+            Err(e) => panic!("wave{}: lower: {e:?}", if wave64 { 64 } else { 32 }),
+        };
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+            && let Err(e) = v.validate(&mut shader.dxil.clone())
+        {
+            panic!("wave{}: DXIL validation failed: {e:?}", if wave64 { 64 } else { 32 });
+        }
+        let views = [
+            View::Mipped(size, size, levels, &texels),
+            View::Buffer {
+                data: &input,
+                stride: Stride::Structured(8),
+            },
+            View::RawUav(64 * 4),
+        ];
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let w = if wave64 { 64 } else { 32 };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                eprintln!("wave{w} {label}: no pipeline; skipped");
+                continue;
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("wave{w} {label}: dispatch failed: {e}"));
+            ran += 1;
+            let got: Vec<f32> = out[0][..64].iter().map(|&x| f32::from_bits(x)).collect();
+            eprintln!("wave{w} {label}: levels {got:?}");
+            for (f, &g) in got.iter().enumerate() {
+                assert!(
+                    (g - 1.0).abs() < 0.02,
+                    "wave{w} {label}: thread ({}, {}) sampled level {g}, the lane quads give 1 (2x2 tiles give 3)",
+                    f % 8,
+                    f / 8
+                );
+            }
+        }
+    }
+    assert!(ran > 0, "no host device ran the test");
+}
+
+fn build_group(
+    words: &[u32],
+    wave64: bool,
+    threads: [u32; 3],
+    rsrc2: u32,
+) -> Result<HostShader, crate::ShaderError> {
+    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 32,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            range(ResourceType::Srv, 0, 8, 0),
+            range(ResourceType::Srv, 8, 4, 8),
+            range(ResourceType::Uav, 16, 4, 0),
+        ],
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let lowered = lowered(&native)?;
+    Ok(HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        static_samplers: lowered
+            .samplers
+            .iter()
+            .map(|&w| super::StaticSampler::from_words(w))
+            .collect(),
+        samplers: lowered.samplers,
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    })
+}
