@@ -18,6 +18,7 @@ No game files, shaders, shader names or caches are in this repository. You need 
 | #1738 | jaschinski97-ops | Preserve live interpolation values, with computed barycentrics |
 | #3047, #3048 | zed6000 | Rasteriser and depth-stencil states named from the pack's register images |
 | #2703 | Calvix2k | A root constant's dword 4 is a value, not a view offset |
+| #2626 | moe-miau | 16-bit packed colour targets the card cannot write (B5G5R5A1, B4G4R4A4) become RGBA8, with the copies converted. Fixes the device-removed crash after the account screen on NVIDIA; no change on cards that support those formats |
 
 ## Measured
 
