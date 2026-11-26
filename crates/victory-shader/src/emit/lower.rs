@@ -5333,20 +5333,34 @@ impl<'a> Lower<'a> {
 
     /// A descriptor load from a table or heap whose dwords the program only
     /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
-    /// as a pointer to title memory: the BVH's address in its SRV) or, for
-    /// a whole image descriptor (eight dwords), also the size fields of
-    /// dwords 1-3 (width, height, first and last level, type: size queries
-    /// of a texture the program never samples). They come from the host's
-    /// view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: four dwords
-    /// per heap index.
+    /// as a pointer to title memory: the BVH's address in its SRV), its
+    /// record count (dword 2) and its format and type (dword 3), the last
+    /// two as the title's own descriptor holds them; or, for a whole image
+    /// descriptor (eight dwords), also the size fields of dwords 1-3 (width,
+    /// height, first and last level, type: size queries of a texture the
+    /// program never samples). They come from the host's view addresses,
+    /// `t1` in [`super::shader::MEMORY_SPACE`]: four dwords per heap index.
     // shortcut: dword 1 holds the address bits only (stride and swizzle read
     // 0) or a texture's width bits, dword 3 a texture's size fields (format,
-    // tiling and swizzle choice read 0 or the identity); dword 4 on and a
-    // buffer's dwords 2-3 (record count, format) stop the program when read;
-    // the table offset's computed part is taken as whole descriptors
-    // (32-byte multiples).
+    // tiling and swizzle choice read 0 or the identity); dwords 4-7 stop the
+    // program when read; the table offset's computed part is taken as whole
+    // descriptors (32-byte multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         const OTHER: Why = "a descriptor read only as data";
+        /// The fields a title reads as data, by dword (the console's buffer
+        /// descriptor: 0-1 the address, 2 the record count, 3 the format and
+        /// type). The host's table holds the first four, so the message
+        /// names the one that was asked for past them.
+        const WORDS: [Why; 8] = [
+            OTHER,
+            OTHER,
+            OTHER,
+            OTHER,
+            "a descriptor's dword 4 read as data",
+            "a descriptor's dword 5 read as data",
+            "a descriptor's dword 6 read as data",
+            "a descriptor's dword 7 read as data",
+        ];
         let a = *self.scalar.get(&site).ok_or("a descriptor read only as data")?;
         if !matches!(
             self.x.native.layout.get(a.param).map(|p| p.root),
@@ -5355,12 +5369,11 @@ impl<'a> Lower<'a> {
             return Err("a descriptor read only as data");
         }
         // The compiler loads image descriptors whole, buffer ones as four
-        // dwords.
-        let known = if count == 8 && a.offset.is_multiple_of(32) { 4 } else { 2 };
+        // dwords; the host's table holds the first four of both.
         let views = self.s.view_addresses_handle();
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
-            let val = if word < known {
+            let val = if word < 4 {
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
                 let four = self.s.m.i32(4);
@@ -5369,7 +5382,7 @@ impl<'a> Lower<'a> {
                 let at = self.s.m.bin(c, Bin::Add, at, w);
                 Val::I32(self.raw_dword(views, at))
             } else {
-                Val::Missing(OTHER)
+                Val::Missing(WORDS.get(word as usize).copied().unwrap_or(OTHER))
             };
             if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                 self.vals.insert(v, val);

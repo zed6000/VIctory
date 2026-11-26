@@ -81,6 +81,8 @@ fn program() -> HostShader {
     w.extend(s_load(1, 16, 4, 0x20)); // s[16:17] = descriptor 1, dwords 0-1
     w.push(S_WAITCNT_ALL);
     w.extend(s_load(0, 18, 16, 0x100)); // s18 = the dword at +0x100
+    // The buffer descriptor's record count and format, read as data.
+    w.extend(s_load(2, 20, 4, 0x28)); // s[20:21] = descriptor 1, dwords 2-3
     w.push(S_WAITCNT_ALL);
     // Pointers into a page no copy holds and into a 256 MiB region with no
     // block, read through: zeros, and both marked missed.
@@ -113,6 +115,10 @@ fn program() -> HostShader {
         w.push(v_mov_b32(5, k));
         w.extend(buffer_store_dword(5, 8, at));
     }
+    w.push(v_mov_b32(5, 20));
+    w.extend(buffer_store_dword(5, 8, 36));
+    w.push(v_mov_b32(7, 21));
+    w.extend(buffer_store_dword(7, 8, 40));
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -252,9 +258,11 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     memory[0x84 / 4] = (-1.0f32).to_bits();
     let value = 0xCAFE_F00D;
     // Heap index 1 (the memory's view) has the title address, index 2 a
-    // texture's size fields.
+    // texture's size fields; four dwords per slot.
     let mut view_addresses = vec![0u32; 4 * 5];
     view_addresses[4..6].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
+    let words = [0x0000_0100, 0x0500_0001];
+    view_addresses[6..8].copy_from_slice(&words);
     let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
     view_addresses[9..12].copy_from_slice(&image);
     let mut ran = 0;
@@ -288,7 +296,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(9),
+                            View::RawUav(11),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
@@ -301,7 +309,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, image[0], image[1], image[2]],
+                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, image[0], image[1], image[2], words[0], words[1]],
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
