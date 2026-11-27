@@ -174,6 +174,20 @@
 //!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
 //!   written pages, where still clear: the host makes views it left null
 //!   until a shader reads them (textures the title placed itself).
+//! * **Early depth** ([`early_depth`]): a pixel program declares
+//!   `[earlydepthstencil]` (`ForceEarlyDepthStencil`, shader flag bit 3)
+//!   where the console tests depth before it
+//!   (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`), and, added 2026-11-27, where
+//!   testing first changes nothing the title sees: the read marks are
+//!   atomics, so without the flag a host driver runs every pixel program
+//!   that reads the heap before it tests depth (no early or hierarchical
+//!   culling), where the console's program has no side effects and is
+//!   culled early. That is a program with render-target outputs only (no
+//!   depth, stencil or coverage, and `DB_SHADER_CONTROL` enables none), no
+//!   coverage input, not primitive-ordered, no discard and no store or
+//!   atomic but the read marks'. The loop limit's discard does not count:
+//!   such a lane's output is wrong anyway, and with the flag it keeps its
+//!   depth. Pixels that fail the depth test then leave no read marks.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -203,6 +217,8 @@ mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod crosslane_tests;
+#[cfg(all(test, windows))]
+mod early_depth_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -262,6 +278,36 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// Which pixel programs declare `[earlydepthstencil]` ("Early depth" in the
+/// module notes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EarlyDepth {
+    /// None.
+    Off,
+    /// Those the console tests depth before (`DEPTH_BEFORE_SHADER`).
+    Console,
+    /// Those, and those whose early test the title cannot see.
+    Unseen,
+}
+
+/// Which pixel programs test depth first: [`EarlyDepth::Unseen`], unless
+/// `VICTORY_SHADER_EARLY_Z` is `console` or `0`/`off` (in any build, to
+/// compare frames and timings). The value is part of the translation, so
+/// the shader cache must key on it (`victory-gpu`'s does).
+pub fn early_depth() -> EarlyDepth {
+    static MODE: std::sync::OnceLock<EarlyDepth> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_early_depth(std::env::var("VICTORY_SHADER_EARLY_Z").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_EARLY_Z`'s value. Pure, for testing.
+fn parse_early_depth(value: Option<&str>) -> EarlyDepth {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "off" | "false" | "no") => EarlyDepth::Off,
+        Some("console") => EarlyDepth::Console,
+        _ => EarlyDepth::Unseen,
+    }
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -646,6 +692,18 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_early_depth_switch_parses() {
+        use super::{EarlyDepth, parse_early_depth};
+        for unseen in [None, Some(""), Some("1"), Some("on")] {
+            assert_eq!(parse_early_depth(unseen), EarlyDepth::Unseen, "{unseen:?}");
+        }
+        for off in ["0", " off ", "FALSE", "no"] {
+            assert_eq!(parse_early_depth(Some(off)), EarlyDepth::Off, "{off:?}");
+        }
+        assert_eq!(parse_early_depth(Some("Console")), EarlyDepth::Console);
     }
     use super::container::SigElement;
     use super::shader::Shader;

@@ -75,6 +75,9 @@ pub(crate) struct Lowered {
     /// Whether depth and stencil are tested before it runs.
     #[cfg(test)]
     pub early_depth: bool,
+    /// `dx.op.discard` calls written.
+    #[cfg(test)]
+    pub discards: u32,
 }
 
 /// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
@@ -620,6 +623,7 @@ impl<'a> Lower<'a> {
             db_shader_control, ..
         } = &x.native.io
             && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            && super::early_depth() != super::EarlyDepth::Off
         {
             s.flags |= flags::EARLY_DEPTH;
         }
@@ -1408,7 +1412,12 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        if super::early_depth() == super::EarlyDepth::Unseen && self.early_depth_unseen() {
+            self.s.flags |= flags::EARLY_DEPTH;
+        }
         Ok(Lowered {
+            #[cfg(test)]
+            discards: self.s.m.written_calls("dx.op.discard") as u32,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -1437,6 +1446,33 @@ impl<'a> Lower<'a> {
             user_data,
             samplers: self.samplers,
         })
+    }
+
+    /// Whether testing depth first changes nothing the title sees, for a
+    /// pixel program the console tests after it (`emit`, "Early depth"):
+    /// render-target outputs only (none of depth, stencil or coverage, and
+    /// `DB_SHADER_CONTROL` enables none), no coverage input (the early test
+    /// would fold into it), not primitive-ordered, no discard but the loop
+    /// limit's ([`Lower::abort_block`]) and no store or atomic but the read
+    /// marks'. Then only the marks of hidden pixels are lost.
+    fn early_depth_unseen(&self) -> bool {
+        let StageIo::Ps { db_shader_control, .. } = self.x.native.io else {
+            return false;
+        };
+        if !self.s.pixel || self.pops {
+            return false;
+        }
+        // Z, stencil test value and op value, coverage to mask, mask export.
+        const EXPORTS: u32 = 1 | 1 << 1 | 1 << 2 | 1 << 7 | 1 << 8;
+        // Only render targets out (16 SV_Target).
+        if db_shader_control & EXPORTS != 0 || self.s.outputs.iter().any(|o| o.kind != 16) {
+            return false;
+        }
+        if self.x.io.inputs.iter().any(|&(_, i)| i == crate::io::Input::SampleCoverage) {
+            return false;
+        }
+        let e = self.s.m.effects(self.s.view_writes, self.abort);
+        !e.kills && !e.writes
     }
 
     fn exported_out(&self, b: usize) -> bool {

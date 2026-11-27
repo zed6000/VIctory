@@ -518,6 +518,43 @@ impl Module {
         }
     }
 
+    /// What the instructions [`Module::write`] writes do that a depth test
+    /// before the program would change ([`Effects`]): a `discard` outside
+    /// block `abort`, and a store or atomic through a resource other than
+    /// `marks` (or to memory at all).
+    pub fn effects(&self, marks: Option<V>, abort: Option<usize>) -> Effects {
+        let plan = self.plan();
+        let mut e = Effects::default();
+        for &b in &plan.layout {
+            for &i in self.blocks[b].body.iter().filter(|&&i| plan.live[i as usize]) {
+                match &self.insts[i as usize].op {
+                    Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => e.writes = true,
+                    Op::Call(f, args) => {
+                        let name = self.funcs[*f as usize].name.as_str();
+                        if name.starts_with("dx.op.discard") {
+                            e.kills |= Some(b) != abort;
+                        } else if [
+                            "dx.op.bufferStore",
+                            "dx.op.rawBufferStore",
+                            "dx.op.textureStore",
+                            "dx.op.atomic",
+                            "dx.op.bufferUpdateCounter",
+                            "dx.op.writeSamplerFeedback",
+                        ]
+                        .iter()
+                        .any(|p| name.starts_with(p))
+                        {
+                            // Arguments: opcode, handle, ...
+                            e.writes |= marks.is_none() || args.get(1).copied() != marks;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        e
+    }
+
     /// What the instructions [`Module::write`] writes use, of what the
     /// shader flags declare (which must match it, or the validator refuses
     /// the module: "Flags must match usage").
@@ -1020,6 +1057,16 @@ const FUNCTION_BLOCK: u64 = 12;
 const VALUE_SYMTAB_BLOCK: u64 = 14;
 const METADATA_BLOCK: u64 = 15;
 const TYPE_BLOCK: u64 = 17;
+
+/// What the written instructions do besides their outputs
+/// ([`Module::effects`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Effects {
+    /// Pixels discard (not counting the block left out).
+    pub kills: bool,
+    /// Stores or atomics (not counting those through the handle left out).
+    pub writes: bool,
+}
 
 /// What the written instructions use of the features shader flags declare
 /// ([`Module::uses`]).
