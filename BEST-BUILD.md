@@ -20,6 +20,7 @@ No game files, shaders, shader names or caches are in this repository. You need 
 | #2703 | Calvix2k | A root constant's dword 4 is a value, not a view offset |
 | #2626 | moe-miau | 16-bit packed colour targets the card cannot write (B5G5R5A1, B4G4R4A4) become RGBA8, with the copies converted. Fixes the device-removed crash after the account screen on NVIDIA; no change on cards that support those formats |
 | #2312 | Xvania7 | Compute dispatches past 65,535 groups in x are spread across z instead of cut (fixes the blocky, unlit tiles: the tile lighting pass asks for 74,000-103,000 groups). All compute pipelines rebuild once after updating |
+| #2085 | 0xkn0wh3r3 | Pixel programs the console tests depth before keep early depth on the host (about 25 % of pixel programs). About 5 ms less GPU time a frame on an RX 7900 XTX, and hidden pixels no longer write title memory. Changed pixel pipelines rebuild once |
 
 ## Measured
 
