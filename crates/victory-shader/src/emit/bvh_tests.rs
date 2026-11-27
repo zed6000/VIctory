@@ -737,6 +737,7 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
         for u in &shader.user_data {
             ud[u.index as usize] = match (u.root, u.slot) {
                 (RootType::Table, 1) => 0,
+                (RootType::Constants, super::DISPATCH_SLOT) => 0,
                 (RootType::Constants, 0) if memory => (TITLE >> (32 * u.dword)) as u32,
                 (RootType::Descriptor, 0) if !memory => (TITLE >> (32 * u.dword)) as u32,
                 _ => panic!("{u:?}"),

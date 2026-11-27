@@ -312,6 +312,7 @@ fn console_user_data(s: &HostShader) -> Vec<u32> {
             (RootType::Table, 0) => 0,
             (RootType::Table, 1) => 32,
             (RootType::Constants, 0) => 0,
+            (RootType::Constants, super::DISPATCH_SLOT) => 0,
             other => panic!("unexpected user data {other:?}"),
         };
     }

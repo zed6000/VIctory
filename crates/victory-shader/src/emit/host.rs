@@ -636,7 +636,7 @@ impl Host {
         let operands = [0x3F7F_FFFF, 0x3F80_0001, 0xBF80_0000];
         let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            if u.root == crate::native::RootType::Constants {
+            if u.root == crate::native::RootType::Constants && u.slot != super::DISPATCH_SLOT {
                 user_data[u.index as usize] = operands[u.dword as usize % 3];
             }
         }

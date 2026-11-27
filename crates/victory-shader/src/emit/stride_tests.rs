@@ -269,7 +269,8 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         for u in &shader.user_data {
             ud[u.index as usize] = match u.root {
                 // The buffer is at heap index 1, the UAV's table at 0.
-                RootType::Constants => 1,
+                RootType::Constants if u.slot != super::DISPATCH_SLOT => 1,
+                RootType::Constants => 0,
                 RootType::Table => 0,
                 other => panic!("unexpected user data {other:?}"),
             };
@@ -337,7 +338,8 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             // The texture at heap index 1, the UAV's table at 0.
-            ud[u.index as usize] = u32::from(u.root == RootType::Constants);
+            ud[u.index as usize] =
+                u32::from(u.root == RootType::Constants && u.slot != super::DISPATCH_SLOT);
         }
         let dispatch = Dispatch {
             // Heap index 1 holds no buffer view: stride 0.
@@ -395,7 +397,8 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
         for u in &shader.user_data {
             ud[u.index as usize] = match u.root {
                 // The constants are at heap index 1, the UAV's table at 0.
-                RootType::Constants => 1,
+                RootType::Constants if u.slot != super::DISPATCH_SLOT => 1,
+                RootType::Constants => 0,
                 RootType::Table => 0,
                 other => panic!("unexpected user data {other:?}"),
             };
@@ -455,7 +458,11 @@ fn a_half_buffer_load_reads_the_half_at_its_address() {
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             // The SRV's table at heap index 0, the UAV's at 1.
-            ud[u.index as usize] = if u.slot == 0 { 0 } else { 32 };
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, super::DISPATCH_SLOT) => 0,
+                (_, 0) => 0,
+                _ => 32,
+            };
         }
         let words = host
             .dispatch(
@@ -557,6 +564,7 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Table, 0) => 0,
                     (RootType::Constants, 1) => clamp,
+                    (RootType::Constants, super::DISPATCH_SLOT) => 0,
                     // The UAV at heap index 1: 32 bytes in.
                     (RootType::Table, 2) => 32,
                     other => panic!("unexpected user data {other:?}"),

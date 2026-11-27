@@ -799,6 +799,7 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
     for u in &s.user_data {
         data[u.index as usize] = match (u.root, u.slot) {
             (RootType::Constants, 0) => k[u.dword as usize],
+            (RootType::Constants, super::DISPATCH_SLOT) => 0,
             // The texture and sampler tables start at heap index 1, the UAV
             // table (compute) at 5, in the console's units.
             (RootType::Table, 1) => 32,

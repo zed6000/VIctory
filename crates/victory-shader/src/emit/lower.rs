@@ -1666,6 +1666,10 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        if self.x.native.stage == HwStage::Cs && !self.counters.contains_key(&order[0]) {
+            self.cs_spread_prologue();
+            self.block[order[0]] = Some(self.cur);
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -1929,6 +1933,63 @@ impl<'a> Lower<'a> {
             self.s
                 .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
         )
+    }
+
+    /// Remaps compute group IDs `(x + z * row, y, 0)` and returns early on
+    /// surplus groups (`eff_x >= asked`) when the host spreads >65,535 groups.
+    fn cs_spread_prologue(&mut self) {
+        let base = self
+            .x
+            .native
+            .layout
+            .iter()
+            .map(|p| u32::from(p.user_data) + p.sgprs)
+            .max()
+            .unwrap_or(0);
+        let row = self.user_at(UserData {
+            index: base,
+            slot: super::DISPATCH_SLOT,
+            root: RootType::Constants,
+            dword: 0,
+        });
+        let asked = self.user_at(UserData {
+            index: base + 1,
+            slot: super::DISPATCH_SLOT,
+            root: RootType::Constants,
+            dword: 1,
+        });
+        let Val::I32(gx) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let Val::I32(gz) = self.compute_id("groupId.i32", 94, 2) else {
+            unreachable!()
+        };
+        let e = self.s.entry;
+        let zero = self.s.m.i32(0);
+        let unspread = self.s.m.cmp(e, pred::EQ, row, zero);
+        let mul = self.s.m.bin(e, Bin::Mul, gz, row);
+        let spread_x = self.s.m.bin(e, Bin::Add, gx, mul);
+        let eff_x = self.s.m.select(e, unspread, gx, spread_x);
+        let eff_z = self.s.m.select(e, unspread, gz, zero);
+        let in_x = self.s.m.cmp(e, pred::IULT, eff_x, asked);
+        let keep = self.s.m.bin(e, Bin::Or, unspread, in_x);
+        let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
+        for (&v, &inp) in &io_inputs {
+            match inp {
+                Input::GroupId(0) => {
+                    self.vals.insert(v, Val::I32(eff_x));
+                }
+                Input::GroupId(2) => {
+                    self.vals.insert(v, Val::I32(eff_z));
+                }
+                _ => {}
+            }
+        }
+        let body = self.s.m.new_block();
+        let ret = self.s.m.new_block();
+        self.s.m.terminate(ret, Term::Ret);
+        self.s.m.terminate(e, Term::CondBr(keep, body, ret));
+        self.cur = body;
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {

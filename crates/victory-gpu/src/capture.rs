@@ -432,7 +432,7 @@ pub(crate) fn read_indirect(
     list: &crate::host::HostList,
     args: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
-    (kind, stride, max): (u32, u32, u32),
+    (kind, stride, max, prefix): (u32, u32, u32, u32),
     name: String,
     always: bool,
 ) {
@@ -493,7 +493,11 @@ pub(crate) fn read_indirect(
             let n = counted.then(|| words[len as usize / 4]);
             let records = n.unwrap_or(max).min(max) as usize;
             let step = stride as usize / 4;
-            let first = |r: usize| &words[r * step..r * step + step.min(4)];
+            let prefix = prefix as usize / 4;
+            let first = |r: usize| {
+                let start = r * step + prefix;
+                &words[start..start + (step - prefix).min(4)]
+            };
             // Draws: vertices (or indices) × instances; dispatches: groups.
             let work = |r: usize| -> u64 {
                 let w = first(r);

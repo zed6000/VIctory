@@ -368,6 +368,40 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
+/// [`UserData::slot`] for host-computed compute dispatch spreading
+/// (`dword = 0`: groups per row, or `0` when unspread; `dword = 1`: asked `x` groups).
+pub const DISPATCH_SLOT: u8 = u8::MAX;
+
+/// Spreads wide, nonempty dispatches with one Z group when the shader can
+/// remap group IDs. Otherwise, bounds each dimension to the D3D12 limit.
+pub fn spread_groups(x: u32, y: u32, z: u32, can_spread: bool) -> (u32, u32, u32, u32, u32) {
+    const LIMIT: u32 = 65_535;
+    if can_spread && x > LIMIT && y != 0 && z == 1 {
+        let rows = x.div_ceil(LIMIT);
+        if rows <= LIMIT {
+            let row = x.div_ceil(rows);
+            return (row, x, row, y.min(LIMIT), rows);
+        }
+    }
+    (0, x, x.min(LIMIT), y.min(LIMIT), z.min(LIMIT))
+}
+
+#[test]
+fn compute_dispatch_group_spreading_decision() {
+    for ((x, y, z, can_spread), expected) in [
+        ((65_535, 1, 1, true), (0, 65_535, 65_535, 1, 1)),
+        ((65_536, 1, 1, true), (32_768, 65_536, 32_768, 1, 2)),
+        ((65_537, 2, 1, true), (32_769, 65_537, 32_769, 2, 2)),
+        ((70_000, 131_072, 1, true), (35_000, 70_000, 35_000, 65_535, 2)),
+        ((65_537, 0, 1, true), (0, 65_537, 65_535, 0, 1)),
+        ((65_537, 1, 0, true), (0, 65_537, 65_535, 1, 0)),
+        ((65_537, 1, 2, true), (0, 65_537, 65_535, 1, 2)),
+        ((65_536, 1, 1, false), (0, 65_536, 65_535, 1, 1)),
+        ((1, 65_536, 65_537, false), (0, 1, 1, 65_535, 65_535)),
+    ] {
+        assert_eq!(spread_groups(x, y, z, can_spread), expected);
+    }
+}
 
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -350,6 +350,9 @@ fn run(
     );
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
+        if u.slot == super::DISPATCH_SLOT {
+            continue;
+        }
         assert_eq!((u.root, u.slot), (RootType::Table, 0), "user data {u:?}");
         ud[u.index as usize] = 0;
     }

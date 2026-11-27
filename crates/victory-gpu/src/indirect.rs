@@ -25,7 +25,7 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint spread; };
 // The title's records, read only; the clamped ones go to the list's own.
 ByteAddressBuffer args : register(t0);
 RWByteAddressBuffer dest : register(u0);
@@ -36,7 +36,7 @@ static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 // Clamps the record at `at` into `dest`; its cost.
-uint clamped(uint at) {
+uint clamped(uint at, uint record) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -52,13 +52,32 @@ uint clamped(uint at) {
             dest.Store2(at + 8, args.Load2(at + 8));
         }
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 requested = args.Load3(at);
+        uint3 g = min(requested, uint3(65535, 65535, 65535));
+        uint row = 0;
+        uint asked = requested.x;
+        if (spread != 0 && asked > 65535 && requested.y != 0 && requested.z == 1) {
+            // Drop records over the per-dispatch budget before rounding up.
+            if (asked > GROUPS) {
+                g = uint3(0, 0, 0);
+            } else {
+                uint rows = (asked + 65534) / 65535;
+                row = (asked + rows - 1) / rows;
+                g = uint3(row, g.y, rows);
+            }
+        }
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        dest.Store3(at, g);
+        if (spread != 0) {
+            dest.Store(record * 20, row);
+            dest.Store(record * 20 + 4, asked);
+            dest.Store3(record * 20 + 8, g);
+        } else {
+            dest.Store3(at, g);
+        }
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
@@ -87,7 +106,7 @@ void main(uint lane : SV_GroupIndex) {
         uint at = record * stride;
         uint cost = 0;
         if (record < records) {
-            cost = clamped(at);
+            cost = clamped(at, record);
         }
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
@@ -106,7 +125,11 @@ void main(uint lane : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
-            dest.Store(at, 0);
+            if (spread != 0 && record < records) {
+                dest.Store3(record * 20 + 8, uint3(0, 0, 0));
+            } else {
+                dest.Store(at, 0);
+            }
         }
     }
     if (lane == 0) {
@@ -203,16 +226,22 @@ fn make() -> windows::core::Result<Clamp> {
 // promoted to a write state the input assembler may not use (the debug
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
-pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
+pub(crate) fn bound(
+    list: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    spread: bool,
+) -> Option<ID3D12Resource> {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return None;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
-    let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
+    let out_stride = if spread { 20 } else { stride };
+    let out = list.arguments(u64::from(out_stride) * u64::from(records.max(1)))?;
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, u32::from(spread)];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
@@ -297,7 +326,7 @@ mod tests {
             let gpu = buffer.GetGPUVirtualAddress();
             let mut out = None;
             for _ in 0..calls {
-                let clamped = super::bound(&list, gpu, spec).unwrap();
+                let clamped = super::bound(&list, gpu, spec, false).unwrap();
                 super::done(&list, &clamped);
                 out = Some(clamped);
             }
@@ -379,7 +408,7 @@ mod tests {
             let recorded: Vec<_> = lists
                 .iter()
                 .map(|l| {
-                    let out = super::bound(l, gpu, (2, 12, 1)).unwrap();
+                    let out = super::bound(l, gpu, (2, 12, 1), false).unwrap();
                     super::done(l, &out);
                     l.close();
                     (out, issued())
@@ -416,5 +445,58 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+
+    #[test]
+    fn spread_records_split_large_x_and_keep_small_unspread() {
+        let Some(host) = super::host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        let cases = [
+            ([115_200, 1, 1], [57_600, 115_200, 57_600, 1, 2]),
+            ([65_535, 1, 1], [0, 65_535, 65_535, 1, 1]),
+            ([65_536, 1, 1], [32_768, 65_536, 32_768, 1, 2]),
+            ([65_537, 1, 1], [32_769, 65_537, 32_769, 1, 2]),
+            ([70_000, 2, 1], [35_000, 70_000, 35_000, 2, 2]),
+            ([100, 2, 1], [0, 100, 100, 2, 1]),
+            ([65_537, 0, 1], [0, 65_537, 65_535, 0, 1]),
+            ([65_537, 1, 0], [0, 65_537, 65_535, 1, 0]),
+            ([80_000, 1, 2], [0, 80_000, 65_535, 1, 2]),
+            ([10, 70_000, 1], [0, 10, 10, 65_535, 1]),
+            ([70_000, 131_072, 1], [35_000, 70_000, 0, 0, 0]),
+            ([65_536, 131_072, 1], [32_768, 65_536, 0, 0, 0]),
+            ([u32::MAX, 1, 1], [0, u32::MAX, 0, 0, 0]),
+        ];
+        let records = cases.len() as u32;
+        let (title, data) = host.shared_buffer(u64::from(records) * 12).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: the mapping covers one triple for each synthetic record.
+        unsafe {
+            for (i, (input, _)) in cases.iter().enumerate() {
+                data.cast::<[u32; 3]>().add(i).write(*input);
+            }
+        }
+        // SAFETY: title is a live D3D12 buffer.
+        let address = unsafe { title.GetGPUVirtualAddress() };
+        let out = super::bound(&list, address, (2, 12, records), true).unwrap();
+        super::done(&list, &out);
+        list.close();
+        // Read back the clamp output. The original records are never dispatched.
+        host.execute(&[&list]);
+        // SAFETY: the output mapping covers five words per completed record.
+        let got = unsafe {
+            let mut mapped = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut mapped)).unwrap();
+            let got = std::slice::from_raw_parts(mapped.cast::<[u32; 5]>(), cases.len()).to_vec();
+            out.Unmap(0, None);
+            got
+        };
+        for ((input, _), output) in cases.iter().zip(&got) {
+            println!("spread record {input:?} -> {output:?}");
+        }
+        for ((input, expected), output) in cases.iter().zip(got) {
+            assert_eq!(output, *expected, "spread record for {input:?}");
+        }
     }
 }
