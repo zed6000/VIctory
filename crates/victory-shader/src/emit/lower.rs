@@ -93,7 +93,14 @@ pub(crate) struct Lowered {
     /// `dx.op.waveActiveBallot` calls emitted into the module.
     #[cfg(test)]
     pub wave_ballots: u32,
+    /// Whether depth and stencil are tested before it runs.
+    #[cfg(test)]
+    pub early_depth: bool,
 }
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
+/// Linux's `gc_10_3_0_sh_mask.h`).
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
@@ -900,6 +907,18 @@ impl<'a> Lower<'a> {
                 rows = Some(cs.threads);
                 s.threads = Some([cs.threads.iter().product(), 1, 1]);
             }
+        }
+        // The console tests depth and stencil before the program runs
+        // (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12, as the compiler
+        // sets it for `[earlydepthstencil]`): so must the host. Without the
+        // flag a host runs a program that writes unordered views for hidden
+        // pixels too, tests depth after it, and keeps those writes.
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = &x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+        {
+            s.flags |= flags::EARLY_DEPTH;
         }
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
@@ -1764,6 +1783,8 @@ impl<'a> Lower<'a> {
             has_half_wave_mask: self.s.m.has_i32_const(!31),
             #[cfg(test)]
             wave_ballots: self.s.m.written_calls("dx.op.waveActiveBallot") as u32,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
