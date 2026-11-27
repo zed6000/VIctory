@@ -2604,6 +2604,7 @@ fn dispatch_wave32(
             for u in &shader.user_data {
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Constants, super::DISPATCH_SLOT) => 0,
                     (RootType::Table, 1) => 0,
                     other => panic!("unexpected user data {other:?}"),
                 };
