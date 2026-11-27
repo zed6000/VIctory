@@ -41,6 +41,8 @@ pub fn record<R>(
 ) -> Option<R> {
     let mut out = None;
     crate::list::with_state(list, |host, state| {
+        // What the library records may write buffers.
+        crate::indirect::end_window(host);
         out = Some(f(&host.list));
         state.host_state_lost();
     });
